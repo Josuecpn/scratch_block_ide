@@ -4,6 +4,7 @@ import type { ProjectRecord } from '../services/database';
 
 export type ViewMode = 'split' | 'script' | 'simulator';
 export type SimDimension = '2D' | '3D';
+export type PythonTargetFlavor = 'spike_v3' | 'pybricks';
 export type BlockCategoryKey =
   | 'events'
   | 'motion'
@@ -20,6 +21,15 @@ export interface WorkspaceBlock {
   label: string;
   param?: string | number;
   unit?: string;
+}
+
+export interface RobotConfigSpec {
+  wheel_diameter_mm: number;
+  axle_track_mm: number;
+  left_motor_port: 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
+  right_motor_port: 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
+  color_sensor_port: 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
+  distance_sensor_port: 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
 }
 
 export const useWorkspaceStore = defineStore('workspace', () => {
@@ -39,6 +49,16 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const simDimension = ref<SimDimension>('2D');
   const splitRatio = ref<number>(54);
   const isSavedInSqlite = ref<boolean>(true);
+  const pythonFlavor = ref<PythonTargetFlavor>('spike_v3');
+
+  const robotConfig = ref<RobotConfigSpec>({
+    wheel_diameter_mm: 56.0,
+    axle_track_mm: 112.0,
+    left_motor_port: 'A',
+    right_motor_port: 'B',
+    color_sensor_port: 'C',
+    distance_sensor_port: 'D',
+  });
 
   const scriptStack = ref<WorkspaceBlock[]>([
     { id: 'blk-1', category: 'events',  opcode: 'when_program_starts', label: 'Quando o programa iniciar' },
@@ -65,9 +85,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     simDimension,
     splitRatio,
     isSavedInSqlite,
+    pythonFlavor,
+    robotConfig,
     scriptStack,
     openProject,
     backToHub,
   };
 });
-

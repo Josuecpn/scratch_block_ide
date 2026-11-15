@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue';
+import { ref, watch, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { storeToRefs } from 'pinia';
 import {
   useWorkspaceStore,
@@ -9,6 +10,16 @@ import {
 } from '../stores/workspace.store';
 import { useSimulationStore } from '../stores/simulation.store';
 import { isTauriRuntime, saveCanvasBlocks } from '../services/database';
+import {
+  compileToMicroPython,
+  exportSpikeProject,
+  injectToLegoHub,
+  listLegoDevices,
+  stopLegoHub,
+  type CompileDiagnostic,
+  type LegoHubDevice,
+  type SpikeExportFormat,
+} from '../services/spikeHardware';
 
 interface CategorySpec {
   key: BlockCategoryKey;
@@ -35,13 +46,31 @@ const {
   simDimension,
   splitRatio,
   isSavedInSqlite,
+  pythonFlavor,
+  robotConfig,
   scriptStack,
 } = storeToRefs(workspaceStore);
 
 const { simState, activeBlockIndex, robotPose, sensors } = storeToRefs(simulationStore);
 
 const isDraggingSplitter = ref(false);
-const activeBottomTab = ref<'console' | 'python'>('console');
+const activeBottomTab = ref<'console' | 'python' | 'llsp3' | 'hardware'>('console');
+
+const generatedPythonCode = ref<string>('');
+const compileDiagnostics = ref<CompileDiagnostic[]>([]);
+const degreesPerCm = ref<number>(20.46);
+const llsp3PreviewJson = ref<string>(
+  '// Clique em "Exportar .llsp3 (Blocos SPIKE)" ou "Exportar .llsp3 (Python SPIKE)" para inspecionar o manifesto e o grafo Scratch 3 (sb3) gerados.'
+);
+const lastExportedPath = ref<string | null>(null);
+
+const availableHubs = ref<LegoHubDevice[]>([]);
+const selectedHubPort = ref<string>('usb://virtual-spike-hub');
+const selectedProtocol = ref<'raw_repl' | 'spike_slot'>('raw_repl');
+const selectedSlotIndex = ref<number>(0);
+const isInjectingHub = ref<boolean>(false);
+
+const portsList = ['A', 'B', 'C', 'D', 'E', 'F'] as const;
 
 const categories: CategorySpec[] = [
   { key: 'events',    label: 'Eventos',     color: '#F59E0B', icon: '⚡' },
@@ -66,18 +95,18 @@ const paletteTemplates: Record<BlockCategoryKey, Omit<WorkspaceBlock, 'id'>[]> =
     { category: 'motion', opcode: 'set_move_speed', label: 'Definir velocidade de movimento para', param: 60, unit: '%' },
   ],
   motors: [
-    { category: 'motors', opcode: 'motor_run_rotations', label: 'Motor Porta A girar por', param: 1, unit: 'rotações' },
+    { category: 'motors', opcode: 'motor_run_rotations', label: 'Motor girar por', param: 1, unit: 'rotações' },
   ],
   sensors: [
-    { category: 'sensors', opcode: 'dist_less_than', label: 'Distância (Porta D) <', param: 15, unit: 'cm' },
-    { category: 'sensors', opcode: 'color_is', label: 'Sensor de Cor (Porta C) é', param: 'Preto' },
+    { category: 'sensors', opcode: 'dist_less_than', label: 'Aguardar Distância <', param: 15, unit: 'cm' },
+    { category: 'sensors', opcode: 'color_is', label: 'Se Sensor de Cor for', param: 'Preto' },
   ],
   control: [
     { category: 'control', opcode: 'wait_seconds', label: 'Esperar', param: 1, unit: 'segundos' },
-    { category: 'control', opcode: 'repeat_times', label: 'Repetir', param: 4, unit: 'vezes' },
+    { category: 'control', opcode: 'repeat_times', label: 'Repetir próximos blocos', param: 4, unit: 'vezes' },
   ],
   operators: [
-    { category: 'operators', opcode: 'math_add', label: 'Somar valores A + B', param: 10 },
+    { category: 'operators', opcode: 'math_add', label: 'Somar ao acumulador +', param: 10 },
   ],
   variables: [
     { category: 'variables', opcode: 'set_var', label: 'Definir [velocidade] para', param: 50 },
@@ -91,6 +120,42 @@ const logs = ref<string[]>([
 
 let simInterval: ReturnType<typeof setInterval> | null = null;
 
+async function refreshCompiledPython() {
+  const res = await compileToMicroPython(
+    currentProject.value.name,
+    scriptStack.value,
+    robotConfig.value,
+    pythonFlavor.value
+  );
+  generatedPythonCode.value = res.python_code;
+  compileDiagnostics.value = res.diagnostics;
+  degreesPerCm.value = res.wheel_degrees_per_cm;
+}
+
+async function refreshHubDevices() {
+  const hubs = await listLegoDevices();
+  availableHubs.value = hubs;
+  if (hubs.length > 0 && !hubs.some((h) => h.port_path === selectedHubPort.value)) {
+    selectedHubPort.value = hubs[0].port_path;
+  }
+  logs.value.push(
+    `[USB Scanner] ${hubs.length} dispositivo(s) LEGO/Serial disponível(is): ${hubs.map((h) => h.port_path).join(', ')}`
+  );
+}
+
+watch(
+  [scriptStack, robotConfig, pythonFlavor, () => currentProject.value.name],
+  () => {
+    void refreshCompiledPython();
+  },
+  { deep: true }
+);
+
+onMounted(async () => {
+  await refreshCompiledPython();
+  await refreshHubDevices();
+});
+
 function getCategoryColor(cat: BlockCategoryKey): string {
   return categories.find((c) => c.key === cat)?.color ?? '#64748B';
 }
@@ -98,7 +163,7 @@ function getCategoryColor(cat: BlockCategoryKey): string {
 function addBlockToStack(tpl: Omit<WorkspaceBlock, 'id'>) {
   scriptStack.value.push({
     ...tpl,
-    id: `blk-${Date.now()}`,
+    id: `blk-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
   });
   isSavedInSqlite.value = false;
   logs.value.push(`[Canvas] Bloco '${tpl.opcode}' conectado na pilha.`);
@@ -124,6 +189,84 @@ async function handleSaveSqlite() {
   await saveCanvasBlocks('canvas-demo-01', payload);
   isSavedInSqlite.value = true;
   logs.value.push(`[SQLite3] ${payload.length} blocos salvos com sucesso em 'blocks'.`);
+}
+
+async function handleCopyPython() {
+  try {
+    await navigator.clipboard.writeText(generatedPythonCode.value);
+    logs.value.push('[Clipboard] Código MicroPython copiado para a área de transferência.');
+  } catch {
+    logs.value.push('[Clipboard] Código pronto na aba MicroPython.');
+  }
+}
+
+async function handleExportFormat(format: SpikeExportFormat) {
+  try {
+    const res = await exportSpikeProject({
+      projectId: currentProject.value.id,
+      projectName: currentProject.value.name,
+      format,
+      robotModel: currentProject.value.robot_model,
+      slotIndex: selectedSlotIndex.value,
+      blocks: scriptStack.value,
+      robotConfig: robotConfig.value,
+      pythonFlavor: pythonFlavor.value,
+    });
+    logs.value.push(res.message);
+    lastExportedPath.value = res.saved_path;
+    if (res.preview_json) {
+      llsp3PreviewJson.value = res.preview_json;
+      activeBottomTab.value = 'llsp3';
+    } else {
+      activeBottomTab.value = 'python';
+    }
+  } catch (err) {
+    logs.value.push(`[Erro Exportação] ${String(err)}`);
+  }
+}
+
+async function handleRevealExportedFile() {
+  if (!lastExportedPath.value || !isTauriRuntime()) return;
+  try {
+    await revealItemInDir(lastExportedPath.value);
+  } catch (err) {
+    logs.value.push(`[Explorer] Não foi possível abrir a pasta: ${String(err)}`);
+  }
+}
+
+async function handleInjectToHub() {
+  if (isInjectingHub.value) return;
+  isInjectingHub.value = true;
+  activeBottomTab.value = 'console';
+  try {
+    const res = await injectToLegoHub({
+      portPath: selectedHubPort.value,
+      protocol: selectedProtocol.value,
+      slotIndex: selectedSlotIndex.value,
+      projectName: currentProject.value.name,
+      blocks: scriptStack.value,
+      robotConfig: robotConfig.value,
+      pythonFlavor: pythonFlavor.value,
+    });
+    for (const line of res.trace_logs) {
+      logs.value.push(line);
+    }
+  } catch (err) {
+    logs.value.push(`[Erro USB Hub] ${String(err)}`);
+  } finally {
+    isInjectingHub.value = false;
+  }
+}
+
+async function handleStopHub() {
+  try {
+    const trace = await stopLegoHub(selectedHubPort.value);
+    for (const line of trace) {
+      logs.value.push(line);
+    }
+  } catch (err) {
+    logs.value.push(`[Erro ao Parar Hub] ${String(err)}`);
+  }
 }
 
 async function executeCurrentBlockStep(blk: WorkspaceBlock) {
@@ -244,25 +387,6 @@ function stopLoop() {
   }
 }
 
-const generatedPythonCode = computed(() => {
-  const lines = [
-    '# Código MicroPython gerado automaticamente (LEGO Spike Prime)',
-    'from hub import port, motion_sensor',
-    'import runloop, motor_pair',
-    '',
-    'async def main():',
-    '    motor_pair.pair(motor_pair.PAIR_1, port.A, port.B)',
-  ];
-  for (const b of scriptStack.value) {
-    if (b.opcode === 'set_move_speed') lines.push(`    velocidade = ${b.param}`);
-    if (b.opcode === 'move_distance')  lines.push(`    await motor_pair.move_for_degrees(motor_pair.PAIR_1, ${Number(b.param) * 20}, 0)`);
-    if (b.opcode === 'turn_degrees')   lines.push(`    await motor_pair.move_for_degrees(motor_pair.PAIR_1, ${Number(b.param) * 2}, 100)`);
-    if (b.opcode === 'wait_seconds')   lines.push(`    await runloop.sleep_ms(${Number(b.param) * 1000})`);
-  }
-  lines.push('', 'runloop.run(main())');
-  return lines.join('\n');
-});
-
 function onSplitterMouseDown() {
   isDraggingSplitter.value = true;
   window.addEventListener('mousemove', onSplitterMouseMove);
@@ -284,7 +408,7 @@ onUnmounted(() => stopLoop());
 
 <template>
   <div class="ide-shell">
-    <!-- ══════════ 1. TOP TOOLBAR (Inspirada na Godot Engine) ══════════ -->
+    <!-- ══════════ 1. TOP TOOLBAR (Simulador + Exportação SPIKE + Injeção USB) ══════════ -->
     <header class="top-toolbar">
       <div class="toolbar-left">
         <button class="btn-hub" title="Voltar ao Gerenciador de Projetos" @click="workspaceStore.backToHub()">
@@ -293,7 +417,10 @@ onUnmounted(() => stopLoop());
         <div class="project-badge">
           <span class="dot-online"></span>
           <strong>{{ currentProject.name }}</strong>
-          <span class="badge-tag">{{ currentProject.robot_model }}</span>
+          <select v-model="currentProject.robot_model" class="hub-model-select" title="Selecionar modelo de Hub LEGO alvo para exportação .llsp3">
+            <option value="SPIKE_PRIME">SPIKE Prime (flipper)</option>
+            <option value="SPIKE_ESSENTIAL">SPIKE Essential (smallhub)</option>
+          </select>
         </div>
       </div>
 
@@ -310,29 +437,49 @@ onUnmounted(() => stopLoop());
         </button>
       </nav>
 
-      <!-- Controles Globais de Execução + Persistência SQLite -->
+      <!-- Controles Globais de Execução + Exportação + Injeção LEGO Hub -->
       <div class="toolbar-right">
         <span class="state-pill" :data-state="simState">
           {{ simState }}
         </span>
 
         <div class="sim-controls">
-          <button class="ctrl-btn play" :disabled="simState === 'Executing'" @click="playSimulation" title="Executar (F5)">
-            ▶ Play
+          <button class="ctrl-btn play" :disabled="simState === 'Executing'" @click="playSimulation" title="Executar no Simulador (F5)">
+            ▶ Simular
           </button>
           <button class="ctrl-btn pause" :disabled="simState !== 'Executing'" @click="pauseSimulation" title="Pausar (F6)">
             ⏸
           </button>
           <button class="ctrl-btn step" @click="stepSimulation" title="Passo a Passo (F10)">
-            ⏭ Step
+            ⏭
           </button>
           <button class="ctrl-btn reset" @click="resetSimulation" title="Reiniciar Robô (Ctrl+R)">
             ⟲
           </button>
         </div>
 
+        <div class="export-Quickbar">
+          <button class="btn-export py" title="Exportar script MicroPython (.py)" @click="handleExportFormat('py')">
+            🐍 .py
+          </button>
+          <button class="btn-export llsp" title="Exportar projeto nativo de blocos do site LEGO SPIKE (.llsp3)" @click="handleExportFormat('llsp3_blocks')">
+            🧩 .llsp3 (Blocos)
+          </button>
+          <button class="btn-export llsp-py" title="Exportar projeto nativo Python do site LEGO SPIKE (.llsp3)" @click="handleExportFormat('llsp3_python')">
+            📦 .llsp3 (Python)
+          </button>
+          <button
+            class="btn-inject"
+            :disabled="isInjectingHub"
+            title="Compilar e injetar diretamente no Hub LEGO via USB"
+            @click="handleInjectToHub"
+          >
+            ⚡ {{ isInjectingHub ? 'Enviando...' : 'Injetar no Robô' }}
+          </button>
+        </div>
+
         <button class="btn-save" @click="handleSaveSqlite">
-          💾 {{ isSavedInSqlite ? 'Salvo (SQLite)' : 'Salvar*' }}
+          💾 {{ isSavedInSqlite ? 'Salvo' : 'Salvar*' }}
         </button>
       </div>
     </header>
@@ -381,7 +528,13 @@ onUnmounted(() => stopLoop());
 
         <div class="block-canvas">
           <div class="canvas-hud">
-            <span>Canvas Principal · Clique em um bloco da paleta para encaixar</span>
+            <span>
+              Canvas Principal · Motores <strong>{{ robotConfig.left_motor_port }}+{{ robotConfig.right_motor_port }}</strong>
+              ({{ degreesPerCm }}°/cm)
+            </span>
+            <span v-if="compileDiagnostics.length > 0" class="diag-badge">
+              ⚠️ {{ compileDiagnostics[0].message }}
+            </span>
           </div>
 
           <div class="block-stack-container">
@@ -458,19 +611,19 @@ onUnmounted(() => stopLoop());
 
         <div class="sensor-inspector">
           <div class="sensor-card">
-            <small>PORTA A · MOTOR ESQ</small>
+            <small>PORTA {{ robotConfig.left_motor_port }} · MOTOR ESQ</small>
             <strong>{{ sensors.portA_leftMotor }}%</strong>
           </div>
           <div class="sensor-card">
-            <small>PORTA B · MOTOR DIR</small>
+            <small>PORTA {{ robotConfig.right_motor_port }} · MOTOR DIR</small>
             <strong>{{ sensors.portB_rightMotor }}%</strong>
           </div>
           <div class="sensor-card">
-            <small>PORTA C · COR</small>
+            <small>PORTA {{ robotConfig.color_sensor_port }} · COR</small>
             <strong>{{ sensors.portC_color }}</strong>
           </div>
           <div class="sensor-card">
-            <small>PORTA D · DISTÂNCIA</small>
+            <small>PORTA {{ robotConfig.distance_sensor_port }} · DISTÂNCIA</small>
             <strong>{{ sensors.portD_distanceCm }} cm</strong>
           </div>
           <div class="sensor-card">
@@ -481,23 +634,133 @@ onUnmounted(() => stopLoop());
       </section>
     </main>
 
-    <!-- ══════════ 3. PAINEL INFERIOR: CONSOLE & CÓDIGO PYTHON GERADO ══════════ -->
+    <!-- ══════════ 3. PAINEL INFERIOR: CONSOLE, MICROPYTHON, .LLSP3 & HARDWARE USB ══════════ -->
     <footer class="bottom-dock">
       <div class="dock-tabs">
         <button :class="{ active: activeBottomTab === 'console' }" @click="activeBottomTab = 'console'">
-          🖥 Console de Execução ({{ logs.length }})
+          🖥 Console ({{ logs.length }})
         </button>
         <button :class="{ active: activeBottomTab === 'python' }" @click="activeBottomTab = 'python'">
-          🐍 Código MicroPython Gerado
+          🐍 MicroPython ({{ pythonFlavor === 'spike_v3' ? 'SPIKE v3' : 'Pybricks' }})
         </button>
-        <span class="dock-status">SQLite3 WAL · 60 FPS · Tauri v2 IPC Ready</span>
+        <button :class="{ active: activeBottomTab === 'llsp3' }" @click="activeBottomTab = 'llsp3'">
+          📦 Pacote Nativo .llsp3 (SPIKE Web)
+        </button>
+        <button :class="{ active: activeBottomTab === 'hardware' }" @click="activeBottomTab = 'hardware'">
+          🔌 Robô LEGO & Injeção USB ({{ availableHubs.length }})
+        </button>
+        <span class="dock-status">SQLite3 WAL · Rust Compiler · LEGO VID 0x0694 Ready</span>
       </div>
 
       <div class="dock-content">
+        <!-- ABA 1: CONSOLE DE EXECUÇÃO E TELEMETRIA -->
         <div v-if="activeBottomTab === 'console'" class="console-lines">
           <div v-for="(line, i) in logs" :key="i" class="log-line">{{ line }}</div>
         </div>
-        <pre v-else class="python-preview"><code>{{ generatedPythonCode }}</code></pre>
+
+        <!-- ABA 2: CÓDIGO MICROPYTHON COMPILADO + CONTROLES DE ALVO -->
+        <div v-else-if="activeBottomTab === 'python'" class="python-tab-layout">
+          <div class="python-toolbar">
+            <label class="inline-field">
+              <span>API Alvo:</span>
+              <select v-model="pythonFlavor">
+                <option value="spike_v3">LEGO SPIKE App 3 (runloop / motor_pair)</option>
+                <option value="pybricks">Pybricks (PrimeHub / DriveBase)</option>
+              </select>
+            </label>
+            <button class="mini-btn" @click="handleCopyPython">📋 Copiar Código</button>
+            <button class="mini-btn accent" @click="handleExportFormat('py')">💾 Baixar .py</button>
+            <button class="mini-btn" @click="handleExportFormat('llsp3_python')">📦 Exportar .llsp3 (Python)</button>
+            <button v-if="lastExportedPath" class="mini-btn" @click="handleRevealExportedFile">
+              📂 Ver em Downloads
+            </button>
+          </div>
+          <pre class="python-preview"><code>{{ generatedPythonCode }}</code></pre>
+        </div>
+
+        <!-- ABA 3: PREVIEW DO PACOTE NATIVO .LLSP3 (MANIFEST + SCRATCH 3 SB3 / PYTHON) -->
+        <div v-else-if="activeBottomTab === 'llsp3'" class="python-tab-layout">
+          <div class="python-toolbar">
+            <span>Formato nativo ZIP do site oficial <strong>spike.legoeducation.com</strong>:</span>
+            <button class="mini-btn accent" @click="handleExportFormat('llsp3_blocks')">
+              🧩 Gerar e Baixar .llsp3 (Word Blocks)
+            </button>
+            <button class="mini-btn" @click="handleExportFormat('llsp3_python')">
+              🐍 Gerar e Baixar .llsp3 (Python)
+            </button>
+            <button v-if="lastExportedPath" class="mini-btn" @click="handleRevealExportedFile">
+              📂 Ver em Downloads ({{ lastExportedPath }})
+            </button>
+          </div>
+          <pre class="python-preview"><code>{{ llsp3PreviewJson }}</code></pre>
+        </div>
+
+        <!-- ABA 4: CONFIGURAÇÃO DO ROBÔ E INJEÇÃO DIRETA VIA USB SERIAL -->
+        <div v-else class="hardware-panel">
+          <div class="hw-group">
+            <strong>1. Conexão USB / Serial com Hub LEGO:</strong>
+            <div class="hw-row">
+              <select v-model="selectedHubPort" class="hw-select">
+                <option v-for="h in availableHubs" :key="h.id" :value="h.port_path">
+                  {{ h.label }}
+                </option>
+              </select>
+              <button class="mini-btn" @click="refreshHubDevices">🔄 Escanear USB</button>
+              <select v-model="selectedProtocol" class="hw-select-sm">
+                <option value="raw_repl">Protocolo: MicroPython Raw REPL (Execução Imediata)</option>
+                <option value="spike_slot">Protocolo: Gravar Slot Flash + Executar</option>
+              </select>
+              <label class="inline-field">
+                <span>Slot:</span>
+                <input v-model.number="selectedSlotIndex" type="number" min="0" max="19" class="hw-num" />
+              </label>
+              <button class="mini-btn inject" :disabled="isInjectingHub" @click="handleInjectToHub">
+                ⚡ Injetar Agora
+              </button>
+              <button class="mini-btn danger" @click="handleStopHub">
+                ⏹ Parar Motores
+              </button>
+            </div>
+          </div>
+
+          <div class="hw-group">
+            <strong>2. Portas e Geometria Física (afeta cálculo de graus no MicroPython):</strong>
+            <div class="hw-row">
+              <label class="inline-field">
+                <span>Motor Esq:</span>
+                <select v-model="robotConfig.left_motor_port">
+                  <option v-for="p in portsList" :key="p" :value="p">Porta {{ p }}</option>
+                </select>
+              </label>
+              <label class="inline-field">
+                <span>Motor Dir:</span>
+                <select v-model="robotConfig.right_motor_port">
+                  <option v-for="p in portsList" :key="p" :value="p">Porta {{ p }}</option>
+                </select>
+              </label>
+              <label class="inline-field">
+                <span>Sensor Cor:</span>
+                <select v-model="robotConfig.color_sensor_port">
+                  <option v-for="p in portsList" :key="p" :value="p">Porta {{ p }}</option>
+                </select>
+              </label>
+              <label class="inline-field">
+                <span>Sensor Dist:</span>
+                <select v-model="robotConfig.distance_sensor_port">
+                  <option v-for="p in portsList" :key="p" :value="p">Porta {{ p }}</option>
+                </select>
+              </label>
+              <label class="inline-field">
+                <span>Ø Roda (mm):</span>
+                <input v-model.number="robotConfig.wheel_diameter_mm" type="number" min="20" max="120" class="hw-num" />
+              </label>
+              <label class="inline-field">
+                <span>Bitola (mm):</span>
+                <input v-model.number="robotConfig.axle_track_mm" type="number" min="40" max="300" class="hw-num" />
+              </label>
+            </div>
+          </div>
+        </div>
       </div>
     </footer>
   </div>
@@ -526,7 +789,7 @@ onUnmounted(() => stopLoop());
 .toolbar-left, .toolbar-right {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 .btn-hub {
   background: #262c3a;
@@ -557,6 +820,16 @@ onUnmounted(() => stopLoop());
   border-radius: 4px;
   font-weight: 700;
 }
+.hub-model-select {
+  background: #312e81;
+  color: #e0e7ff;
+  border: 1px solid #4338ca;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  font-weight: 700;
+  cursor: pointer;
+}
 .mode-switcher {
   display: flex;
   background: #11141c;
@@ -568,7 +841,7 @@ onUnmounted(() => stopLoop());
   background: transparent;
   color: #94a3b8;
   border: none;
-  padding: 5px 14px;
+  padding: 5px 12px;
   border-radius: 6px;
   font-size: 12px;
   font-weight: 600;
@@ -602,7 +875,7 @@ onUnmounted(() => stopLoop());
   border: 1px solid #334155;
   background: #1e293b;
   color: #f8fafc;
-  padding: 5px 10px;
+  padding: 5px 9px;
   border-radius: 6px;
   font-size: 12px;
   cursor: pointer;
@@ -615,6 +888,40 @@ onUnmounted(() => stopLoop());
 .ctrl-btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+.export-Quickbar {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-left: 1px solid #2b3142;
+  padding-left: 8px;
+}
+.btn-export {
+  background: #1e293b;
+  border: 1px solid #3b4254;
+  color: #e2e8f0;
+  padding: 5px 9px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-export:hover {
+  border-color: #38bdf8;
+  color: #38bdf8;
+}
+.btn-inject {
+  background: #d97706;
+  border: 1px solid #f59e0b;
+  color: #ffffff;
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.btn-inject:hover {
+  background: #b45309;
 }
 .btn-save {
   background: #262c3a;
@@ -723,8 +1030,19 @@ onUnmounted(() => stopLoop());
 }
 .canvas-hud {
   font-size: 11px;
-  color: #64748b;
+  color: #94a3b8;
   margin-bottom: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.diag-badge {
+  background: #713f12;
+  color: #fde047;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-weight: 600;
 }
 .block-stack-container {
   display: flex;
@@ -762,7 +1080,7 @@ onUnmounted(() => stopLoop());
   opacity: 0.75;
 }
 .block-field-input {
-  width: 52px;
+  width: 58px;
   background: rgba(15, 23, 42, 0.45);
   border: 1px solid rgba(255, 255, 255, 0.35);
   color: #fff;
@@ -864,7 +1182,7 @@ onUnmounted(() => stopLoop());
   color: #38bdf8;
 }
 .bottom-dock {
-  height: 155px;
+  height: 175px;
   background: #13161f;
   border-top: 1px solid #2b3142;
   display: flex;
@@ -877,7 +1195,7 @@ onUnmounted(() => stopLoop());
   display: flex;
   align-items: center;
   padding: 0 12px;
-  gap: 8px;
+  gap: 6px;
 }
 .dock-tabs button {
   background: transparent;
@@ -909,9 +1227,90 @@ onUnmounted(() => stopLoop());
   padding: 2px 0;
   color: #cbd5e1;
 }
+.python-tab-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.python-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #23293a;
+  font-family: system-ui, sans-serif;
+}
+.inline-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #cbd5e1;
+}
+.inline-field select,
+.hw-select,
+.hw-select-sm,
+.hw-num {
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #334155;
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+.hw-num {
+  width: 58px;
+}
+.mini-btn {
+  background: #262c3a;
+  border: 1px solid #3b4254;
+  color: #e2e8f0;
+  padding: 4px 9px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.mini-btn.accent {
+  background: #0284c7;
+  border-color: #38bdf8;
+  color: #fff;
+}
+.mini-btn.inject {
+  background: #d97706;
+  border-color: #f59e0b;
+  color: #fff;
+}
+.mini-btn.danger {
+  background: #991b1b;
+  border-color: #ef4444;
+  color: #fff;
+}
 .python-preview {
   margin: 0;
   color: #a7f3d0;
+  white-space: pre-wrap;
+}
+.hardware-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-family: system-ui, sans-serif;
+}
+.hw-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.hw-group strong {
+  font-size: 11px;
+  color: #94a3b8;
+}
+.hw-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 </style>
-
