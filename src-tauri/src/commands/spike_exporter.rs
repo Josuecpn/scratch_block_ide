@@ -311,7 +311,7 @@ fn build_spike_word_blocks_projectbody(
                     idx == 0,
                 )
             }
-            "turn_degrees" => {
+            "turn_degrees" | "turn_left" => {
                 add_ext("flippermotor");
                 let port_shadow = add_shadow_menu(
                     &mut sb3_blocks,
@@ -319,7 +319,11 @@ fn build_spike_word_blocks_projectbody(
                     &blk.id,
                     "flippermotor_multiple-port-selector",
                     "field_flippermotor_multiple-port-selector",
-                    &cfg.right_motor_port,
+                    if blk.opcode == "turn_left" {
+                        &cfg.left_motor_port
+                    } else {
+                        &cfg.right_motor_port
+                    },
                 );
                 let dir_shadow = add_shadow_menu(
                     &mut sb3_blocks,
@@ -327,7 +331,11 @@ fn build_spike_word_blocks_projectbody(
                     &blk.id,
                     "flippermotor_custom-icon-direction",
                     "field_flippermotor_custom-icon-direction",
-                    "clockwise",
+                    if blk.opcode == "turn_left" {
+                        "counterclockwise"
+                    } else {
+                        "clockwise"
+                    },
                 );
                 (
                     "flippermotor_motorTurnForDirection",

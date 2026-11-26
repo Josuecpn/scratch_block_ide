@@ -1,0 +1,43 @@
+[tools]
+node = "24"
+rust = "1.97.1"
+
+[env]
+RUST_BACKTRACE = "1"
+
+[tasks.setup]
+description = "Instala as dependências do frontend (Vue 3, Tauri API, Three.js)"
+run = "npm install"
+
+[tasks.dev]
+description = "Inicia a aplicação Tauri v2 + Vite em modo desenvolvimento"
+run = "npm run tauri dev"
+
+[tasks.build]
+description = "Executa typecheck TypeScript e build do frontend"
+run = "npm run build"
+
+[tasks."build:tauri"]
+description = "Gera o binário/instalador completo da aplicação Tauri v2"
+run = "npm run tauri build"
+
+[tasks."check:fe"]
+description = "Verifica tipagem estrita TypeScript/Vue"
+run = "npx vue-tsc --noEmit"
+
+[tasks."check:be"]
+description = "Verifica compilação do backend Rust (edition 2024)"
+run = "cargo check --manifest-path src-tauri/Cargo.toml"
+
+[tasks.check]
+description = "Valida frontend (TypeScript) e backend (Rust)"
+depends = ["check:fe", "check:be"]
+run = "true"
+
+[tasks.test]
+description = "Executa os testes unitários do backend Rust"
+run = "cargo test --manifest-path src-tauri/Cargo.toml"
+
+[tasks."lint:be"]
+description = "Executa Clippy no backend Rust"
+run = "cargo clippy --manifest-path src-tauri/Cargo.toml"

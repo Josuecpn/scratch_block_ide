@@ -217,6 +217,22 @@ fn generate_spike_v3_code(
                     indent, cfg.color_sensor_port, spike_col
                 ));
             }
+            "set_rgb_color" => {
+                let col_str = param_as_string(&blk.param, "Azul");
+                let spike_col = map_spike_color(&col_str);
+                lines.push(format!("{}from hub import light", indent));
+                lines.push(format!("{}light.color(light.POWER, {})  # LED RGB: {}", indent, spike_col, col_str));
+            }
+            "set_chameleon_mode" => {
+                let mode_str = param_as_string(&blk.param, "Ativado");
+                let enabled = !mode_str.eq_ignore_ascii_case("Desativado");
+                lines.push(format!(
+                    "{}# MODO_CAMALEAO: {} (LED espelha color_sensor.color(port.{}))",
+                    indent,
+                    if enabled { "True" } else { "False" },
+                    cfg.color_sensor_port
+                ));
+            }
             "set_move_speed" => {
                 let pct = param_as_f64(&blk.param, 60.0).clamp(1.0, 100.0);
                 let deg_per_sec = (pct * 10.0).round() as i32;
@@ -237,7 +253,15 @@ fn generate_spike_v3_code(
                 let robot_deg = param_as_f64(&blk.param, 90.0);
                 let motor_deg = (robot_deg * track_ratio).round() as i32;
                 lines.push(format!(
-                    "{}await motor_pair.move_for_degrees(motor_pair.PAIR_1, {}, 100, velocity=velocidade_padrao)  # Giro de {:.1}°",
+                    "{}await motor_pair.move_for_degrees(motor_pair.PAIR_1, {}, 100, velocity=velocidade_padrao)  # Giro à direita {:.1}°",
+                    indent, motor_deg, robot_deg
+                ));
+            }
+            "turn_left" => {
+                let robot_deg = param_as_f64(&blk.param, 90.0);
+                let motor_deg = (robot_deg * track_ratio).round() as i32;
+                lines.push(format!(
+                    "{}await motor_pair.move_for_degrees(motor_pair.PAIR_1, {}, -100, velocity=velocidade_padrao)  # Giro à esquerda {:.1}°",
                     indent, motor_deg, robot_deg
                 ));
             }
@@ -376,6 +400,20 @@ fn generate_pybricks_code(
                 ));
                 lines.push(format!("{}    wait(10)", indent));
             }
+            "set_rgb_color" => {
+                let col_str = param_as_string(&blk.param, "Azul");
+                let pb_col = map_pybricks_color(&col_str);
+                lines.push(format!("{}hub.light.on({})  # LED RGB: {}", indent, pb_col, col_str));
+            }
+            "set_chameleon_mode" => {
+                let mode_str = param_as_string(&blk.param, "Ativado");
+                let enabled = !mode_str.eq_ignore_ascii_case("Desativado");
+                lines.push(format!(
+                    "{}# MODO_CAMALEAO: {} (hub.light.on(color_sensor.color()))",
+                    indent,
+                    if enabled { "True" } else { "False" }
+                ));
+            }
             "set_move_speed" => {
                 let pct = param_as_f64(&blk.param, 60.0).clamp(5.0, 100.0);
                 let speed_mm_s = (pct * 5.0).round() as i32;
@@ -392,6 +430,10 @@ fn generate_pybricks_code(
             "turn_degrees" => {
                 let deg = param_as_f64(&blk.param, 90.0).round() as i32;
                 lines.push(format!("{}robot.turn({})", indent, deg));
+            }
+            "turn_left" => {
+                let deg = param_as_f64(&blk.param, 90.0).round() as i32;
+                lines.push(format!("{}robot.turn(-{})", indent, deg));
             }
             "motor_run_rotations" => {
                 let rot = param_as_f64(&blk.param, 1.0);

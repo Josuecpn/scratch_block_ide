@@ -18,6 +18,12 @@ pub fn get_migrations() -> Vec<Migration> {
             sql: include_str!("../migrations/002_init_workspace.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 3,
+            description: "add_robot_visual_json",
+            sql: include_str!("../migrations/003_robot_visual_and_arena.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 

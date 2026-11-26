@@ -49,10 +49,10 @@ pub fn simulate_block_step(req: SimStepRequest) -> SimStepResponse {
     match req.opcode.as_str() {
         "move_distance" => {
             let cm = req.param.unwrap_or(20.0);
-            let dist_px = cm * 2.2;
+            let dist_mm = cm * 10.0;
             let rad = heading.to_radians();
-            x = (x + rad.cos() * dist_px).clamp(40.0, 440.0);
-            y = (y + rad.sin() * dist_px).clamp(40.0, 260.0);
+            x = (x + rad.cos() * dist_mm).clamp(-900.0, 900.0);
+            y = (y + rad.sin() * dist_mm).clamp(-600.0, 600.0);
             left_motor = 60;
             right_motor = 60;
         }
@@ -61,6 +61,12 @@ pub fn simulate_block_step(req: SimStepRequest) -> SimStepResponse {
             heading = (heading + deg).rem_euclid(360.0);
             left_motor = 50;
             right_motor = -50;
+        }
+        "turn_left" => {
+            let deg = req.param.unwrap_or(90.0);
+            heading = (heading - deg).rem_euclid(360.0);
+            left_motor = -50;
+            right_motor = 50;
         }
         _ => {}
     }

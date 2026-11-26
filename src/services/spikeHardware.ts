@@ -149,6 +149,12 @@ export function compileBlocksLocalFallback(
         lines.push(`${ind}robot.straight(${Math.round(numParam * 10)})  # ${numParam} cm`);
       } else if (blk.opcode === 'turn_degrees') {
         lines.push(`${ind}robot.turn(${Math.round(numParam)})`);
+      } else if (blk.opcode === 'turn_left') {
+        lines.push(`${ind}robot.turn(-${Math.round(numParam)})`);
+      } else if (blk.opcode === 'set_rgb_color') {
+        lines.push(`${ind}hub.light.on(${mapSpikeColorLocal(strParam).replace('color.', 'Color.')})`);
+      } else if (blk.opcode === 'set_chameleon_mode') {
+        lines.push(`${ind}# MODO_CAMALEAO: ${strParam !== 'Desativado' ? 'True' : 'False'}`);
       } else if (blk.opcode === 'motor_run_rotations') {
         lines.push(`${ind}left_motor.run_angle(500, ${Math.round(numParam * 360)})`);
       } else if (blk.opcode === 'dist_less_than') {
@@ -238,8 +244,18 @@ export function compileBlocksLocalFallback(
     } else if (blk.opcode === 'turn_degrees') {
       const deg = Math.round(numParam * trackRatio);
       lines.push(
-        `${ind}await motor_pair.move_for_degrees(motor_pair.PAIR_1, ${deg}, 100, velocity=velocidade_padrao)  # Giro de ${numParam}°`
+        `${ind}await motor_pair.move_for_degrees(motor_pair.PAIR_1, ${deg}, 100, velocity=velocidade_padrao)  # Giro à direita ${numParam}°`
       );
+    } else if (blk.opcode === 'turn_left') {
+      const deg = Math.round(numParam * trackRatio);
+      lines.push(
+        `${ind}await motor_pair.move_for_degrees(motor_pair.PAIR_1, ${deg}, -100, velocity=velocidade_padrao)  # Giro à esquerda ${numParam}°`
+      );
+    } else if (blk.opcode === 'set_rgb_color') {
+      lines.push(`${ind}from hub import light`);
+      lines.push(`${ind}light.color(light.POWER, ${mapSpikeColorLocal(strParam)})  # LED RGB: ${strParam}`);
+    } else if (blk.opcode === 'set_chameleon_mode') {
+      lines.push(`${ind}# MODO_CAMALEAO: ${strParam !== 'Desativado' ? 'True' : 'False'}`);
     } else if (blk.opcode === 'motor_run_rotations') {
       const deg = Math.round(numParam * 360);
       lines.push(

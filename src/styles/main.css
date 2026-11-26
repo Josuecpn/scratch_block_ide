@@ -6,6 +6,10 @@
   padding: 0;
 }
 
+:root {
+  color-scheme: dark;
+}
+
 html,
 body,
 #app {
@@ -16,6 +20,32 @@ body,
   color: #e2e8f0;
   font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+/* Alto contraste garantido para comboboxes nativos no WebKitGTK (Linux) e navegadores */
+select {
+  color-scheme: dark;
+  background-color: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #334155;
+}
+
+select:focus {
+  outline: 2px solid #3b82f6;
+  outline-offset: 1px;
+}
+
+select option,
+select optgroup {
+  background-color: #1e293b;
+  color: #f8fafc;
+}
+
+select option:hover,
+select option:focus,
+select option:checked {
+  background-color: #3b82f6;
+  color: #ffffff;
 }
 
 ::-webkit-scrollbar {
@@ -35,4 +65,3 @@ body,
 ::-webkit-scrollbar-thumb:hover {
   background: #3b82f6;
 }
-
