@@ -582,13 +582,14 @@ function onDragEnd() {
   opacity: 0.75;
 }
 .block-field-input {
-  width: 56px;
-  border: none;
+  width: 58px;
+  border: 1px solid rgba(15, 23, 42, 0.2);
   border-radius: 999px;
   padding: 2px 8px;
   text-align: center;
   font-weight: 700;
   font-size: 12px;
+  background-color: #ffffff;
   color: #0f172a;
 }
 .block-select-input {

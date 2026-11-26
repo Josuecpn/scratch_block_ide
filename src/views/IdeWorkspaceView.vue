@@ -210,7 +210,9 @@ async function handleImportFile(event: Event) {
 
   try {
     const res = await importSpikeFile(file);
-    scriptStack.value = res.blocks;
+    // Substitui completamente o estado anterior e reinicia a simulação
+    simulationStore.resetRobot();
+    scriptStack.value = [...res.blocks];
     if (res.detectedKit) {
       workspaceStore.setRobotKit(res.detectedKit);
     }
@@ -231,7 +233,8 @@ async function handleImportFile(event: Event) {
 async function handleImportPastedPython() {
   try {
     const { blocks, warnings } = parsePythonToBlocks(pastedPythonText.value, degreesPerCm.value);
-    scriptStack.value = blocks;
+    simulationStore.resetRobot();
+    scriptStack.value = [...blocks];
     isSavedInSqlite.value = false;
     showPastePythonModal.value = false;
     pastedPythonText.value = '';
@@ -516,7 +519,7 @@ onUnmounted(() => stopLoop());
           <input
             ref="importFileInput"
             type="file"
-            accept=".py,.llsp3"
+            accept=".py,.llsp3,.llsp,.json"
             class="hidden-file-input"
             @change="handleImportFile"
           />

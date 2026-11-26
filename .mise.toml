@@ -18,8 +18,45 @@ description = "Executa typecheck TypeScript e build do frontend"
 run = "npm run build"
 
 [tasks."build:tauri"]
-description = "Gera o binário/instalador completo da aplicação Tauri v2"
+description = "Gera o binário/instalador nativo da plataforma atual"
 run = "npm run tauri build"
+
+[tasks."build:linux"]
+description = "Gera instaladores Linux (.deb, .rpm, .AppImage) para x86_64"
+# Pré-requisito: rustup target add x86_64-unknown-linux-gnu
+run = "npm run tauri build -- --target x86_64-unknown-linux-gnu"
+
+[tasks."build:windows"]
+description = "Cross-compila instalador Windows (.msi / .exe NSIS) a partir do Linux via cargo-xwin"
+# Pré-requisitos no Linux:
+#   rustup target add x86_64-pc-windows-msvc
+#   cargo install cargo-xwin
+#   pacotes do sistema: clang, lld, llvm, nsis
+run = "npm run tauri build -- --target x86_64-pc-windows-msvc --runner cargo-xwin"
+
+[tasks."build:windows-gnu"]
+description = "Cross-compila executável Windows (.exe) a partir do Linux via MinGW-w64"
+# Pré-requisitos no Linux:
+#   rustup target add x86_64-pc-windows-gnu
+#   pacotes do sistema: mingw-w64-gcc, nsis
+run = "npm run tauri build -- --target x86_64-pc-windows-gnu"
+
+[tasks."build:macos"]
+description = "Gera pacote macOS (.app / .dmg) para Apple Silicon (aarch64)"
+# Nota: o empacotamento nativo de .dmg/.app exige ambiente macOS (ou runner macos-latest no GitHub Actions).
+# Pré-requisito no macOS: rustup target add aarch64-apple-darwin
+run = "npm run tauri build -- --target aarch64-apple-darwin"
+
+[tasks."build:macos-intel"]
+description = "Gera pacote macOS (.app / .dmg) para Intel (x86_64)"
+# Nota: exige ambiente macOS (ou runner macos-latest no GitHub Actions).
+# Pré-requisito no macOS: rustup target add x86_64-apple-darwin
+run = "npm run tauri build -- --target x86_64-apple-darwin"
+
+[tasks."build:all"]
+description = "Valida frontend/backend e compila os alvos suportados no host Linux (Linux + Windows)"
+depends = ["check", "build:linux", "build:windows"]
+run = "echo 'Builds Linux e Windows concluídos. Para macOS, execute mise run build:macos em um host macOS ou CI.'"
 
 [tasks."check:fe"]
 description = "Verifica tipagem estrita TypeScript/Vue"
