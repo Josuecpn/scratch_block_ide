@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import {
   listProjects,
   createProject,
@@ -15,6 +15,8 @@ const projects = ref<ProjectRecord[]>([]);
 const searchQuery = ref('');
 const showCreateModal = ref(false);
 const isCreating = ref(false);
+const isLoading = ref(false);
+const loadError = ref<string | null>(null);
 
 const newProjectName = ref('');
 const newProjectInitialState = ref<InitialWorkspaceState>('clean');
@@ -28,12 +30,43 @@ const filteredProjects = computed(() =>
 );
 
 async function refreshProjects() {
-  projects.value = await listProjects();
+  isLoading.value = true;
+  loadError.value = null;
+  try {
+    projects.value = await listProjects();
+  } catch (err) {
+    loadError.value = err instanceof Error ? err.message : String(err);
+    projects.value = [];
+  } finally {
+    isLoading.value = false;
+  }
 }
 
 onMounted(async () => {
   await refreshProjects();
 });
+
+watch(
+  () => workspaceStore.activeScreen,
+  (screen) => {
+    if (screen === 'hub') {
+      void refreshProjects();
+    }
+  }
+);
+
+function formatUpdatedAt(iso: string): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('pt-BR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
 
 function openModal() {
   newProjectName.value = '';
@@ -115,7 +148,19 @@ function kitLabel(model: ProjectRecord['robot_model']): string {
       </aside>
 
       <section class="projects-area">
-        <div v-if="filteredProjects.length === 0" class="empty-state">
+        <div v-if="loadError" class="error-banner">
+          <div>
+            <strong>Erro ao carregar projetos do SQLite3:</strong>
+            <p>{{ loadError }}</p>
+          </div>
+          <button class="btn-primary" @click="refreshProjects">🔄 Tentar novamente</button>
+        </div>
+
+        <div v-if="isLoading" class="empty-state">
+          <p>Carregando projetos do banco local...</p>
+        </div>
+
+        <div v-else-if="filteredProjects.length === 0 && !loadError" class="empty-state">
           <p>Nenhum projeto encontrado.</p>
           <button class="btn-primary" @click="openModal">+ Criar Primeiro Projeto</button>
         </div>
@@ -149,7 +194,7 @@ function kitLabel(model: ProjectRecord['robot_model']): string {
               <h3>{{ proj.name }}</h3>
               <p>{{ proj.description }}</p>
               <div class="card-footer">
-                <span>Rev #{{ proj.revision }}</span>
+                <span>Rev #{{ proj.revision }} · {{ formatUpdatedAt(proj.updated_at) }}</span>
                 <span class="open-link">Abrir no Workspace →</span>
               </div>
             </div>
@@ -192,7 +237,7 @@ function kitLabel(model: ProjectRecord['robot_model']): string {
               @click="newProjectInitialState = 'example'"
             >
               <strong>🧩 Código de Exemplo</strong>
-              <small>Pré-carregado com sequência de movimento e curva.</small>
+              <small>Robô avança até a zona vermelha, para e acende o LED.</small>
             </button>
           </div>
         </div>
@@ -349,6 +394,23 @@ function kitLabel(model: ProjectRecord['robot_model']): string {
   flex: 1;
   overflow-y: auto;
   padding: 24px;
+}
+.error-banner {
+  background: rgba(127, 29, 29, 0.45);
+  border: 1px solid #ef4444;
+  color: #fee2e2;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+}
+.error-banner p {
+  margin-top: 4px;
+  color: #fecaca;
 }
 .empty-state {
   height: 100%;

@@ -2,171 +2,85 @@
 
 > [📚 Índice](README.md) · [← 0. Decisões Arquiteturais (ADRs)](00-decisoes-arquiteturais.md) · [2. Diretrizes de UI/UX →](02-diretrizes-ui-ux.md)
 
-## 1.1 Visão em Camadas
+## 1.1 Visão em Camadas (Implementação Atual)
 
 ```mermaid
 flowchart TB
-    subgraph FE["Frontend - WebView (Vue 3 + TS)"]
+    subgraph FE["Frontend - WebView (Vue 3 + TypeScript + Pinia)"]
         direction TB
-        V["Views: Hub / Workspace"]
-        C["Feature Components: BlockEditor, SimViewport, Inspector, Console"]
-        S["Pinia Stores: hub, project, canvas, robot, environment, simulation, layout"]
-        API["IPC Services (bindings gerados por tauri-specta)"]
-        R2["Renderer 2D (PixiJS)"]
-        R3["Renderer 3D (Three.js / TresJS)"]
-        V --> C --> S --> API
-        C --> R2
-        C --> R3
+        V["Views: HubLauncherView, IdeWorkspaceView"]
+        C["Components: BlockEditorPanel, CanvasBlockNode, SimViewport3D, ArenaEditorPanel, RobotCustomizerPanel"]
+        S["Pinia Stores: workspace.store, simulation.store"]
+        SVC["Services: database.ts, robotKinematics.ts, spikeHardware.ts, spikeImporter.ts"]
+        V --> C --> S --> SVC
     end
 
-    subgraph BE["Backend - Tauri Core (Rust)"]
+    subgraph BE["Backend - Tauri v2 Core (Rust)"]
         direction TB
-        CMD["IPC Layer: commands, events, channels"]
-        APP["Application Services: ProjectService, CompileService, SimulationService"]
-        DOM["Domain: Project, Canvas, Block, RobotConfig, Environment"]
-        INF["Infrastructure: SQLite repositories, FS, Serial/BLE"]
-        CMD --> APP --> DOM
-        APP --> INF
+        CMD["Commands IPC: compiler.rs, spike_exporter.rs, simulation.rs, device.rs"]
+        DB["Persistência: db.rs + tauri-plugin-sql (SQLite3 WAL + Migrations 001..005)"]
     end
 
-    subgraph CR["Crates independentes (puro Rust, sem Tauri)"]
-        COMP["robo-compiler: IR, validação, codegen bytecode e MicroPython"]
-        VM["robo-vm: interpretador cooperativo multi-thread-de-blocos"]
-        SIM["robo-sim: física rapier2d/rapier3d, sensores, motores"]
-    end
-
-    API <-->|"invoke / events / Channel"| CMD
-    APP --> COMP
-    APP --> VM
-    APP --> SIM
-    INF --> DB1[("hub.db")]
-    INF --> DB2[("projeto.robo (SQLite)")]
-    INF -.->|"export / upload"| ROBOT["Robô físico (Spike Hub)"]
+    SVC <-->|"invoke / plugin-sql"| CMD
+    SVC <-->|"SQLite3 Local"| DB
+    DB --> SQL[("roboblocks.db")]
 ```
 
-**Princípios:**
-- **Os crates de domínio (`robo-compiler`, `robo-vm`, `robo-sim`) não dependem do Tauri.** Isso permite testar com `cargo test`, rodar benchmarks e, futuramente, compilar para WASM (versão web).
-- **Clean Architecture no core Tauri:** `ipc` → `application` → `domain`, com a `infrastructure` injetada via traits (por exemplo `ProjectRepository`).
-- **Frontend organizado por feature:** cada feature tem componentes, composables e store próprios. Os stores conversam com o backend *exclusivamente* pela camada `services/ipc`.
-
-## 1.2 Estrutura de Diretórios
+## 1.2 Estrutura Real de Diretórios
 
 ```text
-roboblocks-ide/
-├── Cargo.toml                      # [workspace] members = ["src-tauri", "crates/*"]
-├── package.json                    # Vite + Vue + scripts (tauri dev/build, gen:bindings)
-├── vite.config.ts
-├── tsconfig.json
-├── docs/                           # ADRs, diagramas, guia de contribuição
+scratch_block_ide/
+├── .mise.toml                               # Padronização de Node 24, Rust 1.97.1 e tasks de build/check
+├── rust-toolchain.toml                      # Canal fixo do Rust (1.97.1)
+├── package.json                             # Vue 3, Pinia, Three.js, @tauri-apps/plugin-sql
+├── docs/
+│   ├── ROADMAP.md                           # Próximos passos técnicos e funcionais
+│   └── architecture/                        # Documentação arquitetural e diagramas
+├── example/                                 # Projetos oficiais LEGO SPIKE (.llsp3) para testes
 │
-├── crates/                         # ── Núcleo puro Rust (testável isoladamente) ──
-│   ├── robo-compiler/
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── ir/                 # AST/IR: Program, Script, Stmt, Expr
-│   │       ├── frontend/           # BlockGraph (JSON do canvas) → IR
-│   │       ├── validate/           # tipos, slots vazios, variáveis indefinidas, loops
-│   │       ├── codegen/
-│   │       │   ├── bytecode.rs     # IR → Bytecode (VM do simulador)
-│   │       │   └── micropython.rs  # IR → MicroPython (Spike / Pybricks)
-│   │       └── diagnostics.rs      # Diagnostic { block_id, severity, message }
-│   ├── robo-vm/
-│   │   └── src/                    # Interpreter, Thread (green threads), Scheduler, HAL trait
-│   └── robo-sim/
-│       └── src/
-│           ├── world.rs            # World, fixed-step loop
-│           ├── physics/            # backend rapier2d | rapier3d (feature flags)
-│           ├── robot/              # DifferentialDrive, Motor (PID), Encoder
-│           ├── sensors/            # Color, Distance (raycast), Force, Gyro/IMU
-│           └── hal_sim.rs          # impl robo_vm::Hal para o robô virtual
-│
-├── src-tauri/                      # ── Aplicação Tauri v2 ──
+├── src-tauri/                               # ── Backend Rust / Tauri v2 ──
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
-│   ├── build.rs
-│   ├── capabilities/
-│   │   ├── hub.json                # permissões da janela/rota do Hub
-│   │   └── workspace.json          # permissões do Workspace (dialog, fs escopado, serial)
 │   ├── migrations/
-│   │   ├── hub/0001_init.sql
-│   │   └── project/0001_init.sql
-│   ├── icons/
+│   │   ├── 001_init_hub.sql                 # Tabelas projects e canvas_states
+│   │   ├── 002_init_workspace.sql           # Tabelas blocks, robot_configs, simulation_environments
+│   │   ├── 003_robot_visual_and_arena.sql   # Coluna visual_json em robot_configs
+│   │   ├── 004_custom_definitions.sql       # Coluna definitions_json em canvas_states
+│   │   └── 005_migrate_legacy_blocks.sql    # Normalização de registros legados
 │   └── src/
-│       ├── main.rs                 # chama lib::run()
-│       ├── lib.rs                  # Builder: plugins, state, invoke_handler, specta export
-│       ├── error.rs                # AppError (thiserror + Serialize) → erro tipado no TS
-│       ├── state.rs                # AppState { hub_db, open_projects, sim_sessions }
-│       ├── ipc/
-│       │   ├── mod.rs              # registro de commands (collect_commands!)
-│       │   ├── dto.rs              # DTOs serializáveis (specta::Type)
-│       │   ├── events.rs           # nomes e payloads de eventos
-│       │   └── commands/
-│       │       ├── hub.rs          # list_recent, create_project, open_project, templates
-│       │       ├── project.rs      # save, rename, export, snapshots
-│       │       ├── canvas.rs       # apply_canvas_ops, load_canvas
-│       │       ├── robot.rs        # get/update robot config, ports
-│       │       ├── environment.rs  # CRUD de arena/objetos
-│       │       ├── compiler.rs     # compile, generate_python
-│       │       ├── simulation.rs   # sim_start/pause/step/reset/stop, subscribe
-│       │       └── device.rs       # listar portas seriais/BLE, upload para o robô
-│       ├── application/            # casos de uso (orquestração, transações)
-│       │   ├── project_service.rs
-│       │   ├── compile_service.rs
-│       │   └── simulation_service.rs   # dono da thread de simulação
-│       ├── domain/                 # entidades + traits de repositório
-│       └── infrastructure/
-│           ├── db/
-│           │   ├── pool.rs         # SqlitePool por projeto aberto (WAL mode)
-│           │   └── repositories/   # SqliteProjectRepo, SqliteCanvasRepo, ...
-│           ├── fs/                 # caminhos, thumbnails, import/export .robo
-│           └── device/             # serial (serialport) / BLE (btleplug)
+│       ├── lib.rs                           # Inicialização Tauri + plugin-sql + handlers IPC
+│       ├── db.rs                            # Registro das migrações 1..5
+│       └── commands/
+│           ├── compiler.rs                  # Compilador MicroPython (SPIKE v3 e Pybricks)
+│           ├── spike_exporter.rs            # Gerador .py e .llsp3 (ZIP + scratch.sb3 + roboblocks.json)
+│           ├── simulation.rs                # Healthcheck e passo cinemático auxiliar
+│           └── device.rs                    # Scanner USB e injeção Raw REPL / Slot
 │
-└── src/                            # ── Frontend Vue 3 ──
-    ├── main.ts
-    ├── App.vue
-    ├── router/                     # /hub, /workspace/:projectId
-    ├── bindings/                   # ⚠ GERADO pelo tauri-specta (não editar)
-    │   └── commands.ts
-    ├── services/ipc/               # wrappers finos sobre os bindings (Result → exceção/toast)
-    │   ├── projectApi.ts
-    │   ├── canvasApi.ts
-    │   ├── simulationApi.ts
-    │   └── ...
-    ├── stores/                     # Pinia (setup stores)
-    │   ├── hub.store.ts
-    │   ├── project.store.ts        # metadata + estado de sujeira/autosave
-    │   ├── canvas.store.ts         # grafo de blocos, undo/redo, seleção
-    │   ├── robot.store.ts
-    │   ├── environment.store.ts
-    │   ├── simulation.store.ts     # máquina de estados da execução + telemetria
-    │   ├── layout.store.ts         # docks, split, abas (persistido)
-    │   └── settings.store.ts       # tema, idioma, acessibilidade
-    ├── features/
-    │   ├── hub/                    # HubView, ProjectCard, TemplateGallery, NewProjectDialog
-    │   ├── workspace/              # WorkspaceView, DockLayout, Toolbar, StatusBar
-    │   ├── blocks/
-    │   │   ├── BlockEditor.vue     # wrapper do Blockly
-    │   │   ├── adapter/            # BlockEditorAdapter (interface) + BlocklyAdapter
-    │   │   ├── definitions/        # motion.ts, sensors.ts, control.ts, operators.ts, variables.ts
-    │   │   ├── toolbox/            # categorias, cores, ícones
-    │   │   └── theme/              # tema Spike-like (claro/escuro, alto contraste)
-    │   ├── simulation/
-    │   │   ├── SimViewport.vue     # escolhe o renderer 2D ou 3D
-    │   │   ├── renderers/          # Pixi2DRenderer.ts, Three3DRenderer.ts (interface Renderer)
-    │   │   ├── interpolation.ts    # interpola entre frames da física
-    │   │   ├── RunControls.vue     # Play / Pause / Step / Reset
-    │   │   ├── SensorDebugPanel.vue
-    │   │   └── ArenaEditor/        # gizmos, paleta de objetos, snapping
-    │   ├── robot/                  # RobotConfigurator (portas A–F, dimensões)
-    │   ├── console/                # saída de print, diagnósticos clicáveis (→ bloco)
-    │   └── code-preview/           # visualização somente leitura do MicroPython gerado
-    ├── shared/
-    │   ├── ui/                     # design system: Button, Panel, Tabs, Splitter, Tooltip
-    │   ├── composables/            # useHotkeys, useDebounce, useResizeObserver, useTauriEvent
-    │   ├── types/                  # tipos de UI (os de domínio vêm de bindings/)
-    │   └── utils/
-    ├── assets/                     # ícones, modelos 3D (glTF), texturas de tapetes
-    └── styles/                     # tokens.css (cores por categoria, espaçamentos)
+└── src/                                     # ── Frontend Vue 3 + TypeScript ──
+    ├── App.vue                              # Alternância Hub ↔ Workspace
+    ├── styles/main.css                      # Tema escuro global e contraste para <select>/<option>
+    ├── types/blocks.ts                      # Tipos de blocos, formas, variáveis, listas e Meus Blocos
+    ├── constants/blockCatalog.ts            # Catálogo completo das 11 seções (Motores..Meus Blocos)
+    ├── stores/
+    │   ├── workspace.store.ts               # Projeto ativo, kit (Prime/Essencial), blocos e definições
+    │   └── simulation.store.ts              # Pose 3D, calibração cm/rot, LED RGB, Camaleão e sensores
+    ├── services/
+    │   ├── database.ts                      # CRUD SQLite3 (com fallback localStorage em modo browser)
+    │   ├── robotKinematics.ts               # Cinemática diferencial contínua (requestAnimationFrame + atrito)
+    │   ├── spikeHardware.ts                 # Bridge IPC de compilação, exportação .llsp3 e USB
+    │   └── spikeImporter.ts                 # Parser/validador .llsp3, .llsp, .py e .json (round-trip 1:1)
+    ├── views/
+    │   ├── HubLauncherView.vue              # Hub inicial de projetos + modal de Novo Projeto
+    │   └── IdeWorkspaceView.vue             # IDE completa (Blocos + Simulador 3D + Console/Python/USB)
+    └── components/
+        ├── BlockEditorPanel.vue             # Paleta contínua com Scroll-Spy + Canvas Drag-and-Drop
+        ├── CanvasBlockNode.vue              # Renderizador recursivo (Hat, Stack, Cap, C/E-Block, Pill, Hex)
+        ├── BlockCreationModals.vue          # Modais de Variáveis, Listas, Mensagens e Fazer um Bloco
+        ├── PixelMatrixPicker.vue            # Seletor visual de matriz 5×5 (Luz)
+        ├── SteeringDialPicker.vue           # Seletor circular -100..+100 (Movimento)
+        ├── SimViewport3D.vue                # Cena 3D Three.js (OrbitControls, sombras, rodas, RGB PointLight)
+        ├── ArenaEditorPanel.vue             # Editor de obstáculos, paredes, linhas e zonas (cor + atrito)
+        └── RobotCustomizerPanel.vue         # Customização de kit, portas, dimensões, cor e sensores 3D
 ```
 
 ---

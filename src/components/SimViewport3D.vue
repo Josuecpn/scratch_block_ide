@@ -33,6 +33,9 @@ const {
   detectedColorName,
   detectedColorHex,
   chameleonMode,
+  leftWheelAngleRad,
+  rightWheelAngleRad,
+  surfaceFriction,
 } = storeToRefs(simulationStore);
 
 const containerRef = ref<HTMLDivElement | null>(null);
@@ -49,6 +52,8 @@ let selectionOutline: THREE.BoxHelper | null = null;
 let ledMaterial: THREE.MeshStandardMaterial | null = null;
 let ledPointLight: THREE.PointLight | null = null;
 let sensorBeamMaterial: THREE.MeshBasicMaterial | null = null;
+let leftWheelGroup: THREE.Group | null = null;
+let rightWheelGroup: THREE.Group | null = null;
 let animFrameId: number | null = null;
 let resizeObserver: ResizeObserver | null = null;
 
@@ -290,21 +295,29 @@ function rebuildRobotMesh() {
   arrow.position.set(len * 0.36, hei * 0.78, 0);
   robotGroup.add(arrow);
 
-  // Rodas esquerda e direita
+  // Rodas esquerda e direita articuladas com raios visuais para evidenciar a rotação
   const wheelRadius = Math.max(0.22, hei * 0.36);
   const wheelGeo = new THREE.CylinderGeometry(wheelRadius, wheelRadius, 0.18, 24);
   wheelGeo.rotateX(Math.PI / 2);
   const wheelMat = new THREE.MeshStandardMaterial({ color: vis.wheelColor, roughness: 0.8 });
+  const spokeMat = new THREE.MeshStandardMaterial({ color: '#94a3b8', roughness: 0.4 });
+  const spokeGeo = new THREE.BoxGeometry(wheelRadius * 1.6, 0.05, 0.2);
 
-  const leftWheel = new THREE.Mesh(wheelGeo, wheelMat);
-  leftWheel.position.set(-len * 0.1, wheelRadius, -wid / 2 - 0.1);
-  leftWheel.castShadow = true;
-  robotGroup.add(leftWheel);
+  leftWheelGroup = new THREE.Group();
+  const leftTire = new THREE.Mesh(wheelGeo, wheelMat);
+  leftTire.castShadow = true;
+  const leftSpoke = new THREE.Mesh(spokeGeo, spokeMat);
+  leftWheelGroup.add(leftTire, leftSpoke);
+  leftWheelGroup.position.set(-len * 0.1, wheelRadius, -wid / 2 - 0.1);
+  robotGroup.add(leftWheelGroup);
 
-  const rightWheel = new THREE.Mesh(wheelGeo, wheelMat);
-  rightWheel.position.set(-len * 0.1, wheelRadius, wid / 2 + 0.1);
-  rightWheel.castShadow = true;
-  robotGroup.add(rightWheel);
+  rightWheelGroup = new THREE.Group();
+  const rightTire = new THREE.Mesh(wheelGeo, wheelMat);
+  rightTire.castShadow = true;
+  const rightSpoke = new THREE.Mesh(spokeGeo, spokeMat);
+  rightWheelGroup.add(rightTire, rightSpoke);
+  rightWheelGroup.position.set(-len * 0.1, wheelRadius, wid / 2 + 0.1);
+  robotGroup.add(rightWheelGroup);
 
   // Sensor de Cor (apontando para o chão)
   if (vis.hasColorSensor) {
@@ -385,6 +398,7 @@ function evaluateSensors() {
 
   let detectedHex = '#e2e8f0';
   let detectedLabel = 'Branco';
+  let currentFriction = 1.0;
   const objs = environment.value.objects;
   for (let i = objs.length - 1; i >= 0; i--) {
     const obj = objs[i];
@@ -397,9 +411,13 @@ function evaluateSensors() {
     if (Math.abs(localX) <= obj.width / 2 && Math.abs(localZ) <= obj.depth / 2) {
       detectedHex = obj.color;
       detectedLabel = classifyHexToSpikeColorName(obj.color);
+      if (obj.friction !== undefined) {
+        currentFriction = obj.friction;
+      }
       break;
     }
   }
+  surfaceFriction.value = currentFriction;
   detectedColorHex.value = detectedHex;
   detectedColorName.value = detectedLabel;
   sensors.value.portC_color = `${detectedLabel} (${detectedHex})`;
@@ -501,6 +519,12 @@ function onPointerUp() {
 
 watch(simDimension, (dim) => applyCameraPreset(dim));
 watch(robotPose, () => syncRobotTransform(), { deep: true });
+watch(leftWheelAngleRad, (ang) => {
+  if (leftWheelGroup) leftWheelGroup.rotation.z = -ang;
+});
+watch(rightWheelAngleRad, (ang) => {
+  if (rightWheelGroup) rightWheelGroup.rotation.z = -ang;
+});
 watch(robotVisual, () => rebuildRobotMesh(), { deep: true });
 watch(
   ledColor,

@@ -268,45 +268,53 @@ fn build_spike_word_blocks_projectbody(
                     true,
                 )
             }
-            "set_move_speed" => (
-                "control_wait",
-                json!({
-                    "DURATION": [1, [5, "0.1"]]
-                }),
-                json!({}),
-                idx == 0,
-            ),
-            "move_distance" => {
-                // Converte cm para rotações no motor configurado (compatível com SPIKE Essential e Prime)
-                add_ext("flippermotor");
-                let port_shadow = add_shadow_menu(
-                    &mut sb3_blocks,
-                    format!("{}_mport", blk.id),
-                    &blk.id,
-                    "flippermotor_multiple-port-selector",
-                    "field_flippermotor_multiple-port-selector",
-                    &cfg.left_motor_port,
-                );
+            "set_move_speed" => {
+                add_ext("flippermove");
+                (
+                    "flippermove_movementSpeed",
+                    json!({
+                        "SPEED": [1, [4, param_str]]
+                    }),
+                    json!({}),
+                    idx == 0,
+                )
+            }
+            "move_distance" | "move_direction_for" => {
+                add_ext("flippermove");
+                let dir_val = blk
+                    .fields
+                    .as_ref()
+                    .and_then(|f| f.get("direction"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("forward");
+                let unit_val = blk
+                    .fields
+                    .as_ref()
+                    .and_then(|f| f.get("unit"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("cm");
+                let move_val = blk
+                    .fields
+                    .as_ref()
+                    .and_then(|f| f.get("value"))
+                    .map(|v| v.to_string().trim_matches('"').to_string())
+                    .unwrap_or_else(|| param_str.clone());
                 let dir_shadow = add_shadow_menu(
                     &mut sb3_blocks,
                     format!("{}_mdir", blk.id),
                     &blk.id,
-                    "flippermotor_custom-icon-direction",
-                    "field_flippermotor_custom-icon-direction",
-                    "clockwise",
+                    "flippermove_custom-icon-direction",
+                    "field_flippermove_custom-icon-direction",
+                    dir_val,
                 );
-                let cm_val = param_str.parse::<f64>().unwrap_or(20.0);
-                let circ_cm = (std::f64::consts::PI * cfg.wheel_diameter_mm.max(10.0)) / 10.0;
-                let rots = format!("{:.2}", cm_val / circ_cm);
                 (
-                    "flippermotor_motorTurnForDirection",
+                    "flippermove_move",
                     json!({
-                        "PORT": port_shadow,
                         "DIRECTION": dir_shadow,
-                        "VALUE": [1, [4, rots]]
+                        "VALUE": [1, [4, move_val]]
                     }),
                     json!({
-                        "UNIT": ["rotations", Value::Null]
+                        "UNIT": [unit_val, Value::Null]
                     }),
                     idx == 0,
                 )
@@ -673,6 +681,13 @@ pub fn generate_export_payload(
             let monitors_str = serde_json::to_string(&monitors_json).map_err(|e| e.to_string())?;
             let icon_svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80"><rect width="80" height="80" rx="14" fill="#FACC15"/><rect x="18" y="22" width="44" height="36" rx="6" fill="#1E293B"/><circle cx="31" cy="40" r="5" fill="#38BDF8"/><circle cx="49" cy="40" r="5" fill="#38BDF8"/></svg>"##;
 
+            let roboblocks_meta_str = serde_json::to_string(&json!({
+                "formatVersion": 1,
+                "robotModel": req.robot_model,
+                "blocks": req.blocks
+            }))
+            .map_err(|e| e.to_string())?;
+
             let zip_bytes = if is_blocks {
                 let scratch_sb3_bytes = build_zip_archive(&[
                     ("project.json", projectbody_str.as_bytes()),
@@ -683,12 +698,14 @@ pub fn generate_export_payload(
                     ("scratch.sb3", &scratch_sb3_bytes),
                     ("icon.svg", icon_svg.as_bytes()),
                     ("monitors.json", monitors_str.as_bytes()),
+                    ("roboblocks.json", roboblocks_meta_str.as_bytes()),
                 ])
             } else {
                 build_zip_archive(&[
                     ("manifest.json", manifest_str.as_bytes()),
                     ("projectbody.json", projectbody_str.as_bytes()),
                     ("icon.svg", icon_svg.as_bytes()),
+                    ("roboblocks.json", roboblocks_meta_str.as_bytes()),
                 ])
             };
 
@@ -767,6 +784,7 @@ mod tests {
                 label: "Quando o programa iniciar".into(),
                 param: None,
                 unit: None,
+                ..Default::default()
             },
             BlockInputDto {
                 id: "blk-2".into(),
@@ -775,6 +793,7 @@ mod tests {
                 label: "Mover".into(),
                 param: Some(serde_json::json!(25)),
                 unit: Some("cm".into()),
+                ..Default::default()
             },
         ]
     }
@@ -815,7 +834,7 @@ mod tests {
             .preview_json
             .as_deref()
             .unwrap_or("")
-            .contains("flippermotor_motorTurnForDirection"));
+            .contains("flippermove_move"));
         assert!(res_blocks
             .preview_json
             .as_deref()

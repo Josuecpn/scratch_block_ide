@@ -13,29 +13,20 @@ import {
   type RobotVisualConfig,
   type SimulationEnvironmentRecord,
 } from '../services/database';
+import {
+  createDefaultCanvasDefinitions,
+  type BlockCategoryKey,
+  type CanvasDefinitions,
+  type CustomBlockSegment,
+  type WorkspaceBlock,
+} from '../types/blocks';
 import { useSimulationStore } from './simulation.store';
 
+export type { BlockCategoryKey, WorkspaceBlock };
 export type ViewMode = 'split' | 'script' | 'simulator';
 export type SimDimension = '2D' | '3D';
 export type PythonTargetFlavor = 'spike_v3' | 'pybricks';
 export type PortLetter = 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
-export type BlockCategoryKey =
-  | 'events'
-  | 'motion'
-  | 'motors'
-  | 'sensors'
-  | 'control'
-  | 'operators'
-  | 'variables';
-
-export interface WorkspaceBlock {
-  id: string;
-  category: BlockCategoryKey;
-  opcode: string;
-  label: string;
-  param?: string | number;
-  unit?: string;
-}
 
 export interface RobotConfigSpec {
   wheel_diameter_mm: number;
@@ -84,6 +75,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   );
 
   const scriptStack = ref<WorkspaceBlock[]>(createCleanBlocks());
+  const definitions = ref<CanvasDefinitions>(createDefaultCanvasDefinitions());
 
   const availablePorts = computed<readonly PortLetter[]>(() =>
     currentProject.value.robot_model === 'SPIKE_ESSENTIAL'
@@ -93,6 +85,60 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   function markDirty() {
     isSavedInSqlite.value = false;
+  }
+
+  function addVariable(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return null;
+    if (definitions.value.variables.some((v) => v.name === trimmed)) return null;
+    const item = { id: `var-${Date.now()}`, name: trimmed, value: 0, monitored: true };
+    definitions.value.variables.push(item);
+    isSavedInSqlite.value = false;
+    return item;
+  }
+
+  function addList(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return null;
+    if (definitions.value.lists.some((l) => l.name === trimmed)) return null;
+    const item = { id: `list-${Date.now()}`, name: trimmed, items: [], monitored: true };
+    definitions.value.lists.push(item);
+    isSavedInSqlite.value = false;
+    return item;
+  }
+
+  function addMessage(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (!definitions.value.messages.includes(trimmed)) {
+      definitions.value.messages.push(trimmed);
+      isSavedInSqlite.value = false;
+    }
+  }
+
+  function addCustomBlock(name: string, segments: CustomBlockSegment[]) {
+    const trimmed = name.trim() || 'meu bloco';
+    const def = {
+      id: `myblk-${Date.now()}`,
+      name: trimmed,
+      segments,
+    };
+    definitions.value.customBlocks.push(def);
+
+    // Insere automaticamente o bloco chapéu de definição na área de programação
+    const sigText = segments.length > 0
+      ? segments.map((s) => (s.kind === 'label' ? s.text : s.kind === 'boolean' ? `<${s.text}>` : `(${s.text})`)).join(' ')
+      : trimmed;
+    scriptStack.value.push({
+      id: `blk-def-${Date.now()}`,
+      category: 'my_blocks',
+      opcode: 'my_block_define',
+      shape: 'hat',
+      label: `definir ${trimmed} ${segments.length > 0 ? sigText : ''}`.trim(),
+      customBlockId: def.id,
+    });
+    isSavedInSqlite.value = false;
+    return def;
   }
 
   function setRobotKit(model: RobotKitModel) {
@@ -136,6 +182,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         currentProject.value = bundle.project;
         activeCanvas.value = bundle.canvas;
         scriptStack.value = bundle.blocks;
+        definitions.value = bundle.definitions ?? createDefaultCanvasDefinitions();
         robotConfig.value = bundle.robotConfig;
         robotVisual.value = bundle.robotVisual;
         environment.value = bundle.environment;
@@ -151,6 +198,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
           zoom: 1,
         };
         scriptStack.value = createCleanBlocks();
+        definitions.value = createDefaultCanvasDefinitions();
         robotConfig.value = createDefaultRobotConfig(project.robot_model);
         robotVisual.value = createDefaultRobotVisual(project.robot_model);
         environment.value = createDefaultEnvironment(project.id, project.dimension);
@@ -177,6 +225,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       project: currentProject.value,
       canvas: activeCanvas.value,
       blocks: scriptStack.value,
+      definitions: definitions.value,
       robotConfig: robotConfig.value,
       robotVisual: robotVisual.value,
       environment: environment.value,
@@ -204,8 +253,13 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     robotVisual,
     environment,
     scriptStack,
+    definitions,
     availablePorts,
     markDirty,
+    addVariable,
+    addList,
+    addMessage,
+    addCustomBlock,
     setRobotKit,
     openProject,
     saveCurrentProject,

@@ -1,9 +1,13 @@
 import Database from '@tauri-apps/plugin-sql';
-import type {
-  BlockCategoryKey,
-  RobotConfigSpec,
-  WorkspaceBlock,
-} from '../stores/workspace.store';
+import type { RobotConfigSpec } from '../stores/workspace.store';
+import {
+  createDefaultCanvasDefinitions,
+  sanitizeBlockTree,
+  type BlockCategoryKey,
+  type CanvasDefinitions,
+  type WorkspaceBlock,
+} from '../types/blocks';
+import { CATALOG_BY_OPCODE } from '../constants/blockCatalog';
 
 const DB_PATH = 'sqlite:roboblocks.db';
 const LOCAL_STORAGE_KEY = 'roboblocks_local_projects_v1';
@@ -31,6 +35,7 @@ export interface CanvasStateRecord {
   scroll_x: number;
   scroll_y: number;
   zoom: number;
+  definitions_json?: string;
 }
 
 export interface RobotVisualConfig {
@@ -59,6 +64,7 @@ export interface ArenaObject {
   height: number;
   rotationDeg: number;
   color: string;
+  friction?: number; // 1.0 = aderente padrão, < 1.0 = superfície escorregadia (ex: 0.25 gelo)
 }
 
 export interface SimulationEnvironmentRecord {
@@ -78,6 +84,7 @@ export interface LoadedProjectBundle {
   project: ProjectRecord;
   canvas: CanvasStateRecord;
   blocks: WorkspaceBlock[];
+  definitions: CanvasDefinitions;
   robotConfig: RobotConfigSpec;
   robotVisual: RobotVisualConfig;
   environment: SimulationEnvironmentRecord;
@@ -181,13 +188,14 @@ export function createDefaultArenaObjects(): ArenaObject[] {
       id: 'zone-red-1',
       type: 'color_zone',
       label: 'Zona Vermelha',
-      x: 380,
-      z: -160,
-      width: 180,
-      depth: 180,
+      x: 240,
+      z: 0,
+      width: 200,
+      depth: 200,
       height: 3,
       rotationDeg: 0,
       color: '#ef4444',
+      friction: 1.0,
     },
     {
       id: 'obs-box-1',
@@ -222,16 +230,68 @@ export function createDefaultEnvironment(
   };
 }
 
-export function createExampleBlocks(): WorkspaceBlock[] {
+export function createExampleBlocks(colorSensorPort = 'C'): WorkspaceBlock[] {
   const uid = () => `blk-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
   return [
-    { id: uid(), category: 'events', opcode: 'when_program_starts', label: 'Quando o programa iniciar' },
-    { id: uid(), category: 'motion', opcode: 'set_move_speed', label: 'Definir velocidade de movimento para', param: 60, unit: '%' },
-    { id: uid(), category: 'motion', opcode: 'move_distance', label: 'Mover para frente por', param: 30, unit: 'cm' },
-    { id: uid(), category: 'motion', opcode: 'turn_degrees', label: 'Girar à direita por', param: 90, unit: 'graus' },
-    { id: uid(), category: 'motion', opcode: 'move_distance', label: 'Mover para frente por', param: 20, unit: 'cm' },
-    { id: uid(), category: 'motion', opcode: 'turn_left', label: 'Virar à esquerda por', param: 90, unit: 'graus' },
-    { id: uid(), category: 'control', opcode: 'wait_seconds', label: 'Esperar', param: 1, unit: 'segundos' },
+    {
+      id: uid(),
+      category: 'events',
+      opcode: 'when_program_starts',
+      shape: 'hat',
+      label: 'Quando o programa iniciar',
+    },
+    {
+      id: uid(),
+      category: 'motion',
+      opcode: 'set_move_speed',
+      shape: 'stack',
+      label: 'Definir velocidade de movimento a',
+      param: 50,
+      unit: '%',
+      fields: { speed: 50 },
+    },
+    {
+      id: uid(),
+      category: 'motion',
+      opcode: 'move_start_direction',
+      shape: 'stack',
+      label: 'Iniciar movimento',
+      fields: { direction: 'forward' },
+    },
+    {
+      id: uid(),
+      category: 'control',
+      opcode: 'wait_until',
+      shape: 'stack',
+      label: 'Espera até que',
+      slots: {
+        CONDITION: {
+          id: uid(),
+          category: 'sensors',
+          opcode: 'color_is',
+          shape: 'boolean',
+          label: `${colorSensorPort} é a cor Vermelho ?`,
+          param: 'Vermelho',
+          fields: { port: colorSensorPort, color: 'Vermelho' },
+        },
+      },
+    },
+    {
+      id: uid(),
+      category: 'motion',
+      opcode: 'move_stop',
+      shape: 'stack',
+      label: 'Parar de mover',
+    },
+    {
+      id: uid(),
+      category: 'light',
+      opcode: 'set_rgb_color',
+      shape: 'stack',
+      label: 'Definir luz do botão central',
+      param: 'Vermelho',
+      fields: { color: 'Vermelho' },
+    },
   ];
 }
 
@@ -241,9 +301,82 @@ export function createCleanBlocks(): WorkspaceBlock[] {
       id: `blk-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
       category: 'events',
       opcode: 'when_program_starts',
+      shape: 'hat',
       label: 'Quando o programa iniciar',
     },
   ];
+}
+
+export function normalizeLegacyBlock(
+  raw: WorkspaceBlock,
+  visited = new Set<string>(),
+  depth = 0
+): WorkspaceBlock {
+  if (depth > 32 || visited.has(raw.id)) {
+    return {
+      id: `${raw.id}-dedup`,
+      category: raw.category,
+      opcode: raw.opcode,
+      label: raw.label,
+      shape: raw.shape ?? 'stack',
+    };
+  }
+  visited.add(raw.id);
+
+  let opcode = raw.opcode;
+  let category = raw.category;
+
+  if (opcode === 'set_rgb_color') category = 'light';
+  if (opcode === 'motor_run_rotations') {
+    opcode = 'motor_run_for';
+    category = 'motors';
+  }
+
+  const entry = CATALOG_BY_OPCODE.get(opcode);
+  const shape = raw.shape ?? entry?.shape ?? 'stack';
+  const fields: Record<string, string | number | boolean> = {
+    ...(entry?.defaultFields ?? {}),
+    ...(raw.fields ?? {}),
+  };
+
+  if (raw.param !== undefined && Object.keys(raw.fields ?? {}).length === 0) {
+    if (opcode === 'set_move_speed') fields.speed = raw.param;
+    else if (opcode === 'wait_seconds') fields.seconds = raw.param;
+    else if (opcode === 'repeat_times') fields.times = raw.param;
+    else if (opcode === 'color_is' || opcode === 'when_color_detected' || opcode === 'set_rgb_color') {
+      fields.color = raw.param;
+    } else if (opcode === 'set_chameleon_mode') fields.enabled = raw.param;
+    else if (opcode === 'motor_run_for' || opcode === 'move_distance') fields.value = raw.param;
+  }
+
+  return {
+    ...raw,
+    opcode,
+    category,
+    shape,
+    label: entry?.label ?? raw.label,
+    fields: Object.keys(fields).length > 0 ? fields : undefined,
+    slots: raw.slots
+      ? Object.fromEntries(
+          Object.entries(raw.slots).map(([k, v]) => [
+            k,
+            v && !visited.has(v.id) ? normalizeLegacyBlock(v, visited, depth + 1) : null,
+          ])
+        )
+      : undefined,
+    children:
+      shape === 'c_block' || shape === 'e_block'
+        ? (raw.children ?? [])
+            .filter((c) => !visited.has(c.id))
+            .map((c) => normalizeLegacyBlock(c, visited, depth + 1))
+        : raw.children,
+    elseChildren:
+      shape === 'e_block'
+        ? (raw.elseChildren ?? [])
+            .filter((c) => !visited.has(c.id))
+            .map((c) => normalizeLegacyBlock(c, visited, depth + 1))
+        : raw.elseChildren,
+  };
 }
 
 export function isTauriRuntime(): boolean {
@@ -254,51 +387,36 @@ export async function getDb(): Promise<Database | null> {
   if (!isTauriRuntime()) {
     return null;
   }
-  if (!dbInstance) {
-    dbInstance = await Database.load(DB_PATH);
+  if (dbInstance) {
+    return dbInstance;
   }
-  return dbInstance;
+
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      dbInstance = await Database.load(DB_PATH);
+      return dbInstance;
+    } catch (err) {
+      dbInstance = null;
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+    }
+  }
+  throw new Error(
+    `Falha ao abrir banco SQLite3 (${DB_PATH}): ${lastError instanceof Error ? lastError.message : String(lastError)}`
+  );
 }
 
 function readLocalStore(): Record<string, LoadedProjectBundle> {
   try {
     const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
-    if (raw) {
+    if (raw !== null) {
       return JSON.parse(raw) as Record<string, LoadedProjectBundle>;
     }
   } catch {
     // Ignore corrupted storage
   }
-  const demoId = 'proj-demo-01';
-  const demoProject: ProjectRecord = {
-    id: demoId,
-    name: 'Seguidor de Linha (Spike Prime)',
-    description: 'Projeto exemplo com sensor de cor e controle proporcional simples.',
-    robot_model: 'SPIKE_PRIME',
-    dimension: '3D',
-    favorite: 1,
-    revision: 1,
-    updated_at: new Date().toISOString(),
-  };
-  const seed: Record<string, LoadedProjectBundle> = {
-    [demoId]: {
-      project: demoProject,
-      canvas: {
-        id: 'canvas-demo-01',
-        project_id: demoId,
-        name: 'Script Principal',
-        scroll_x: 0,
-        scroll_y: 0,
-        zoom: 1,
-      },
-      blocks: createExampleBlocks(),
-      robotConfig: createDefaultRobotConfig('SPIKE_PRIME'),
-      robotVisual: createDefaultRobotVisual('SPIKE_PRIME'),
-      environment: createDefaultEnvironment(demoId, '3D'),
-    },
-  };
-  writeLocalStore(seed);
-  return seed;
+  return {};
 }
 
 function writeLocalStore(data: Record<string, LoadedProjectBundle>): void {
@@ -310,16 +428,21 @@ function writeLocalStore(data: Record<string, LoadedProjectBundle>): void {
 }
 
 export async function listProjects(): Promise<ProjectRecord[]> {
-  const db = await getDb();
-  if (!db) {
-    const store = readLocalStore();
-    return Object.values(store)
-      .map((b) => b.project)
-      .sort((a, b) => b.favorite - a.favorite || b.updated_at.localeCompare(a.updated_at));
+  try {
+    const db = await getDb();
+    if (!db) {
+      const store = readLocalStore();
+      return Object.values(store)
+        .map((b) => b.project)
+        .sort((a, b) => b.favorite - a.favorite || b.updated_at.localeCompare(a.updated_at));
+    }
+    return await db.select<ProjectRecord[]>(
+      'SELECT * FROM projects ORDER BY favorite DESC, updated_at DESC'
+    );
+  } catch (err) {
+    console.error('[SQLite3] Erro ao listar projetos:', err);
+    throw err;
   }
-  return await db.select<ProjectRecord[]>(
-    'SELECT * FROM projects ORDER BY favorite DESC, updated_at DESC'
-  );
 }
 
 interface RawBlockRow {
@@ -365,28 +488,35 @@ function reconstructBlockOrder(rows: RawBlockRow[]): WorkspaceBlock[] {
   }
 
   return ordered.map((r) => {
-    let fields: { label?: string; param?: string | number; unit?: string } = {};
+    let parsed: Partial<WorkspaceBlock> = {};
     try {
-      fields = JSON.parse(r.fields_json || '{}');
+      parsed = JSON.parse(r.fields_json || '{}');
     } catch {
-      fields = {};
+      parsed = {};
     }
-    return {
+    return normalizeLegacyBlock({
       id: r.id,
       category: r.category as BlockCategoryKey,
       opcode: r.opcode,
-      label: fields.label ?? r.opcode,
-      param: fields.param,
-      unit: fields.unit,
-    };
+      label: parsed.label ?? r.opcode,
+      shape: parsed.shape,
+      param: parsed.param,
+      unit: parsed.unit,
+      fields: parsed.fields,
+      slots: parsed.slots,
+      children: parsed.children,
+      elseChildren: parsed.elseChildren,
+      customBlockId: parsed.customBlockId,
+    });
   });
 }
 
 async function persistBlocksToSqlite(
   db: Database,
   canvasId: string,
-  blocks: WorkspaceBlock[]
+  rawBlocks: WorkspaceBlock[]
 ): Promise<void> {
+  const blocks = sanitizeBlockTree(rawBlocks);
   await db.execute('DELETE FROM blocks WHERE canvas_id = $1', [canvasId]);
 
   // Inserção em ordem reversa garante que next_id sempre aponte para um id já inserido (PRAGMA foreign_keys = ON)
@@ -395,8 +525,14 @@ async function persistBlocksToSqlite(
     const nextId = blocks[i + 1]?.id ?? null;
     const fieldsJson = JSON.stringify({
       label: b.label,
+      shape: b.shape,
       param: b.param,
       unit: b.unit,
+      fields: b.fields,
+      slots: b.slots,
+      children: b.children,
+      elseChildren: b.elseChildren,
+      customBlockId: b.customBlockId,
     });
     await db.execute(
       `INSERT INTO blocks (id, canvas_id, opcode, category, next_id, x, y, fields_json)
@@ -428,10 +564,13 @@ export async function createProject(options: CreateProjectOptions): Promise<Proj
     updated_at: now,
   };
 
-  const blocks = options.initialState === 'example' ? createExampleBlocks() : createCleanBlocks();
   const robotConfig = createDefaultRobotConfig(options.robotModel);
   const robotVisual = createDefaultRobotVisual(options.robotModel);
   const environment = createDefaultEnvironment(id, dimension);
+  const blocks =
+    options.initialState === 'example'
+      ? createExampleBlocks(robotConfig.color_sensor_port)
+      : createCleanBlocks();
 
   const db = await getDb();
   if (db) {
@@ -492,6 +631,7 @@ export async function createProject(options: CreateProjectOptions): Promise<Proj
         zoom: 1,
       },
       blocks,
+      definitions: createDefaultCanvasDefinitions(),
       robotConfig,
       robotVisual,
       environment,
@@ -506,7 +646,13 @@ export async function loadProjectBundle(projectId: string): Promise<LoadedProjec
   const db = await getDb();
   if (!db) {
     const store = readLocalStore();
-    return store[projectId] ?? null;
+    const bundle = store[projectId] ?? null;
+    if (!bundle) return null;
+    return {
+      ...bundle,
+      blocks: bundle.blocks.map((b) => normalizeLegacyBlock(b)),
+      definitions: bundle.definitions ?? createDefaultCanvasDefinitions(),
+    };
   }
 
   const projects = await db.select<ProjectRecord[]>(
@@ -531,6 +677,14 @@ export async function loadProjectBundle(projectId: string): Promise<LoadedProjec
     ];
   }
   const canvas = canvases[0];
+  let definitions = createDefaultCanvasDefinitions();
+  if (canvas.definitions_json && canvas.definitions_json !== '{}') {
+    try {
+      definitions = { ...definitions, ...JSON.parse(canvas.definitions_json) };
+    } catch {
+      // Keep default definitions
+    }
+  }
 
   const rawBlocks = await db.select<RawBlockRow[]>(
     'SELECT * FROM blocks WHERE canvas_id = $1',
@@ -625,6 +779,7 @@ export async function loadProjectBundle(projectId: string): Promise<LoadedProjec
     project,
     canvas,
     blocks,
+    definitions,
     robotConfig,
     robotVisual,
     environment,
@@ -668,13 +823,14 @@ export async function saveFullProject(bundle: LoadedProjectBundle): Promise<Load
   );
 
   await db.execute(
-    `INSERT INTO canvas_states (id, project_id, name, scroll_x, scroll_y, zoom)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO canvas_states (id, project_id, name, scroll_x, scroll_y, zoom, definitions_json)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT(id) DO UPDATE SET
        name = excluded.name,
        scroll_x = excluded.scroll_x,
        scroll_y = excluded.scroll_y,
-       zoom = excluded.zoom`,
+       zoom = excluded.zoom,
+       definitions_json = excluded.definitions_json`,
     [
       bundle.canvas.id,
       updatedProject.id,
@@ -682,6 +838,7 @@ export async function saveFullProject(bundle: LoadedProjectBundle): Promise<Load
       bundle.canvas.scroll_x,
       bundle.canvas.scroll_y,
       bundle.canvas.zoom,
+      JSON.stringify(bundle.definitions),
     ]
   );
 

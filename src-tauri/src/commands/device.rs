@@ -408,6 +408,7 @@ mod tests {
                 label: "Quando iniciar".into(),
                 param: None,
                 unit: None,
+                ..Default::default()
             }],
             robot_config: None,
             python_flavor: None,

@@ -3,8 +3,8 @@ import { isTauriRuntime } from './database';
 import type {
   PythonTargetFlavor,
   RobotConfigSpec,
-  WorkspaceBlock,
 } from '../stores/workspace.store';
+import type { WorkspaceBlock } from '../types/blocks';
 
 export interface CompileDiagnostic {
   block_id: string | null;
@@ -256,6 +256,33 @@ export function compileBlocksLocalFallback(
       lines.push(`${ind}light.color(light.POWER, ${mapSpikeColorLocal(strParam)})  # LED RGB: ${strParam}`);
     } else if (blk.opcode === 'set_chameleon_mode') {
       lines.push(`${ind}# MODO_CAMALEAO: ${strParam !== 'Desativado' ? 'True' : 'False'}`);
+    } else if (blk.opcode === 'move_direction_for') {
+      const f = blk.fields ?? {};
+      const dir = String(f.direction ?? 'forward');
+      const val = Number(f.value ?? 20);
+      const sign = dir === 'backward' ? -1 : 1;
+      const deg = Math.round(val * degreesPerCm * sign);
+      lines.push(
+        `${ind}await motor_pair.move_for_degrees(motor_pair.PAIR_1, ${deg}, ${dir === 'right' ? 100 : dir === 'left' ? -100 : 0}, velocity=velocidade_padrao)`
+      );
+    } else if (blk.opcode === 'move_steer_for') {
+      const f = blk.fields ?? {};
+      const steer = Number(f.steering ?? 30);
+      const val = Number(f.value ?? 1);
+      lines.push(
+        `${ind}await motor_pair.move_for_degrees(motor_pair.PAIR_1, ${Math.round(val * 360)}, ${steer}, velocity=velocidade_padrao)`
+      );
+    } else if (blk.opcode === 'move_stop') {
+      lines.push(`${ind}motor_pair.stop(motor_pair.PAIR_1)`);
+    } else if (blk.opcode === 'motor_run_for') {
+      const f = blk.fields ?? {};
+      const port = String(f.port ?? cfg.left_motor_port);
+      const val = Number(f.value ?? 1);
+      const dir = String(f.direction ?? 'clockwise') === 'counterclockwise' ? -1 : 1;
+      lines.push(`${ind}await motor.run_for_degrees(port.${port}, ${Math.round(val * 360 * dir)}, velocidade_padrao)`);
+    } else if (blk.opcode === 'motor_stop') {
+      const f = blk.fields ?? {};
+      lines.push(`${ind}motor.stop(port.${String(f.port ?? cfg.left_motor_port)})`);
     } else if (blk.opcode === 'motor_run_rotations') {
       const deg = Math.round(numParam * 360);
       lines.push(
@@ -591,25 +618,49 @@ export async function exportSpikeProject(params: {
             lists: {},
             broadcasts: {},
             blocks: Object.fromEntries(
-              params.blocks.map((b, idx) => [
-                b.id,
-                {
-                  opcode:
-                    b.opcode === 'when_program_starts'
-                      ? 'flipperevents_whenProgramStarts'
-                      : 'control_wait',
+              params.blocks.map((b, idx) => {
+                const base = {
                   next: params.blocks[idx + 1]?.id ?? null,
                   parent: idx === 0 ? null : params.blocks[idx - 1].id,
-                  inputs:
-                    b.opcode === 'when_program_starts'
-                      ? {}
-                      : { DURATION: [1, [5, String(b.param ?? '1')]] },
-                  fields: {},
                   shadow: false,
                   topLevel: idx === 0,
                   ...(idx === 0 ? { x: -130, y: 120 } : {}),
-                },
-              ])
+                };
+                if (b.opcode === 'when_program_starts') {
+                  return [b.id, { ...base, opcode: 'flipperevents_whenProgramStarts', inputs: {}, fields: {} }];
+                }
+                if (b.opcode === 'set_move_speed') {
+                  return [
+                    b.id,
+                    {
+                      ...base,
+                      opcode: 'flippermove_movementSpeed',
+                      inputs: { SPEED: [1, [4, String(b.fields?.speed ?? b.param ?? 60)]] },
+                      fields: {},
+                    },
+                  ];
+                }
+                if (b.opcode === 'move_distance' || b.opcode === 'move_direction_for') {
+                  return [
+                    b.id,
+                    {
+                      ...base,
+                      opcode: 'flippermove_move',
+                      inputs: { VALUE: [1, [4, String(b.fields?.value ?? b.param ?? 20)]] },
+                      fields: { UNIT: [String(b.fields?.unit ?? b.unit ?? 'cm'), null] },
+                    },
+                  ];
+                }
+                return [
+                  b.id,
+                  {
+                    ...base,
+                    opcode: 'control_wait',
+                    inputs: { DURATION: [1, [5, String(b.param ?? '1')]] },
+                    fields: {},
+                  },
+                ];
+              })
             ),
             comments: {},
             currentCostume: 0,
@@ -677,6 +728,12 @@ export async function exportSpikeProject(params: {
   const iconSvg =
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80"><rect width="80" height="80" rx="14" fill="#FACC15"/></svg>';
 
+  const roboblocksMetaStr = JSON.stringify({
+    formatVersion: 1,
+    robotModel: params.robotModel ?? 'SPIKE_PRIME',
+    blocks: params.blocks,
+  });
+
   const zipEntries: Array<[string, Uint8Array]> = isBlocks
     ? [
         ['manifest.json', encoder.encode(manifestStr)],
@@ -689,11 +746,13 @@ export async function exportSpikeProject(params: {
         ],
         ['icon.svg', encoder.encode(iconSvg)],
         ['monitors.json', encoder.encode(monitorsStr)],
+        ['roboblocks.json', encoder.encode(roboblocksMetaStr)],
       ]
     : [
         ['manifest.json', encoder.encode(manifestStr)],
         ['projectbody.json', encoder.encode(projectbodyStr)],
         ['icon.svg', encoder.encode(iconSvg)],
+        ['roboblocks.json', encoder.encode(roboblocksMetaStr)],
       ];
   const zipBytes = buildZipArchiveTs(zipEntries);
 

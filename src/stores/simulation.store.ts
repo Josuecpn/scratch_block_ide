@@ -99,6 +99,22 @@ export const useSimulationStore = defineStore('simulation', () => {
   const detectedColorHex = ref<string>('#e2e8f0');
   const chameleonMode = ref<boolean>(false);
 
+  // Estado Cinemático e Física Contínua
+  const cmPerRotation = ref<number>(17.59); // π * 56mm / 10
+  const moveSpeedPct = ref<number>(60);
+  const motorSpeedPct = ref<Record<string, number>>({
+    A: 75,
+    B: 75,
+    C: 75,
+    D: 75,
+    E: 75,
+    F: 75,
+  });
+  const leftWheelAngleRad = ref<number>(0);
+  const rightWheelAngleRad = ref<number>(0);
+  const surfaceFriction = ref<number>(1.0);
+  const runToken = ref<number>(0);
+
   const sensors = ref({
     portA_leftMotor: 0,
     portB_rightMotor: 0,
@@ -128,12 +144,24 @@ export const useSimulationStore = defineStore('simulation', () => {
     setChameleonMode(!chameleonMode.value);
   }
 
-  function resetRobot() {
+  function cancelActiveMotion() {
+    runToken.value += 1;
+    sensors.value.portA_leftMotor = 0;
+    sensors.value.portB_rightMotor = 0;
+  }
+
+  function resetRobot(wheelDiameterMm = 56.0) {
+    runToken.value += 1;
     simState.value = 'Idle';
     activeBlockIndex.value = null;
     robotPose.value = { ...spawnPose.value };
     ledColor.value = '#38bdf8';
     chameleonMode.value = false;
+    cmPerRotation.value = +((Math.PI * Math.max(10, wheelDiameterMm)) / 10).toFixed(2);
+    moveSpeedPct.value = 60;
+    leftWheelAngleRad.value = 0;
+    rightWheelAngleRad.value = 0;
+    surfaceFriction.value = 1.0;
     sensors.value = {
       portA_leftMotor: 0,
       portB_rightMotor: 0,
@@ -152,11 +180,19 @@ export const useSimulationStore = defineStore('simulation', () => {
     detectedColorName,
     detectedColorHex,
     chameleonMode,
+    cmPerRotation,
+    moveSpeedPct,
+    motorSpeedPct,
+    leftWheelAngleRad,
+    rightWheelAngleRad,
+    surfaceFriction,
+    runToken,
     sensors,
     setSpawnPose,
     setLedColor,
     setChameleonMode,
     toggleChameleonMode,
+    cancelActiveMotion,
     resetRobot,
   };
 });

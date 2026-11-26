@@ -77,11 +77,31 @@ function addObject(type: ArenaObjectType) {
       height: 3,
       rotationDeg: 0,
       color: '#22c55e',
+      friction: 1.0,
     },
   };
 
   const created: ArenaObject = { id, ...defaults[type] };
   environment.value.objects.push(created);
+  isSavedInSqlite.value = false;
+  emit('select-object', id);
+}
+
+function addIceZone() {
+  const id = `obj-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  environment.value.objects.push({
+    id,
+    type: 'color_zone',
+    label: 'Gelo (Atrito 0.25)',
+    x: 0,
+    z: 0,
+    width: 260,
+    depth: 260,
+    height: 3,
+    rotationDeg: 0,
+    color: '#38bdf8',
+    friction: 0.25,
+  });
   isSavedInSqlite.value = false;
   emit('select-object', id);
 }
@@ -108,6 +128,7 @@ function markDirty() {
       <button type="button" class="add-btn" @click="addObject('wall')">+ Parede</button>
       <button type="button" class="add-btn" @click="addObject('line')">+ Linha</button>
       <button type="button" class="add-btn" @click="addObject('color_zone')">+ Zona de Cor</button>
+      <button type="button" class="add-btn" @click="addIceZone">❄️ + Zona Baixo Atrito</button>
     </div>
 
     <div v-if="selectedObject" class="inspector-row">
@@ -134,6 +155,18 @@ function markDirty() {
       <label class="mini-field">
         <span>Rot (°)</span>
         <input v-model.number="selectedObject.rotationDeg" type="number" step="15" class="num-in" @input="markDirty" />
+      </label>
+      <label v-if="selectedObject.type === 'color_zone' || selectedObject.type === 'line'" class="mini-field">
+        <span>Atrito</span>
+        <input
+          :value="selectedObject.friction ?? 1.0"
+          type="number"
+          min="0.1"
+          max="1.0"
+          step="0.05"
+          class="num-in"
+          @input="selectedObject.friction = Number(($event.target as HTMLInputElement).value); markDirty()"
+        />
       </label>
       <div class="mini-field">
         <span>Cor</span>

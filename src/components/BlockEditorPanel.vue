@@ -1,13 +1,22 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { computed, provide, ref } from 'vue';
 import { storeToRefs } from 'pinia';
-import {
-  useWorkspaceStore,
-  type BlockCategoryKey,
-  type WorkspaceBlock,
-} from '../stores/workspace.store';
+import { useWorkspaceStore } from '../stores/workspace.store';
 import { useSimulationStore } from '../stores/simulation.store';
 import type { CompileDiagnostic } from '../services/spikeHardware';
+import {
+  BLOCK_CATEGORIES,
+  BLOCK_CATALOG,
+  type BlockCatalogEntry,
+} from '../constants/blockCatalog';
+import {
+  isSelfOrDescendant,
+  type BlockCategoryKey,
+  type CustomBlockSegment,
+  type WorkspaceBlock,
+} from '../types/blocks';
+import CanvasBlockNode from './CanvasBlockNode.vue';
+import BlockCreationModals, { type ModalKind } from './BlockCreationModals.vue';
 
 interface Props {
   degreesPerCm: number;
@@ -20,120 +29,115 @@ const emit = defineEmits<{
   (e: 'log', message: string): void;
 }>();
 
-interface CategorySpec {
-  key: BlockCategoryKey;
-  label: string;
-  color: string;
-  icon: string;
-}
-
-interface ColorSwatch {
-  name: string;
-  hex: string;
-}
-
-const SPIKE_COLORS: ColorSwatch[] = [
-  { name: 'Preto', hex: '#111827' },
-  { name: 'Vermelho', hex: '#ef4444' },
-  { name: 'Verde', hex: '#22c55e' },
-  { name: 'Azul', hex: '#3b82f6' },
-  { name: 'Amarelo', hex: '#facc15' },
-  { name: 'Branco', hex: '#f8fafc' },
-  { name: 'Magenta', hex: '#d946ef' },
-];
-
-const COLOR_OPCODES = new Set(['when_color_detected', 'color_is', 'set_rgb_color']);
-
 const workspaceStore = useWorkspaceStore();
 const simulationStore = useSimulationStore();
 
-const { currentProject, scriptStack, robotConfig, isSavedInSqlite } = storeToRefs(workspaceStore);
+const { currentProject, scriptStack, robotConfig, definitions, isSavedInSqlite } =
+  storeToRefs(workspaceStore);
 const { simState, activeBlockIndex } = storeToRefs(simulationStore);
 
-const categories: CategorySpec[] = [
-  { key: 'events', label: 'Eventos', color: '#F59E0B', icon: '⚡' },
-  { key: 'motion', label: 'Movimento', color: '#EC4899', icon: '🛞' },
-  { key: 'motors', label: 'Motores', color: '#3B82F6', icon: '⚙️' },
-  { key: 'sensors', label: 'Sensores', color: '#06B6D4', icon: '📡' },
-  { key: 'control', label: 'Controle', color: '#F97316', icon: '🔁' },
-  { key: 'operators', label: 'Operadores', color: '#22C55E', icon: '➗' },
-  { key: 'variables', label: 'Variáveis', color: '#EF4444', icon: '📦' },
-];
-
-const selectedCategory = ref<BlockCategoryKey>('motion');
-const openColorPickerId = ref<string | null>(null);
+const selectedCategory = ref<BlockCategoryKey>('motors');
+const paletteScrollRef = ref<HTMLDivElement | null>(null);
+const sectionRefs = ref<Partial<Record<BlockCategoryKey, HTMLElement>>>({});
+const isProgrammaticScroll = ref(false);
+const activeModal = ref<ModalKind>(null);
 
 // Estado de Drag-and-Drop
 const dragSource = ref<
-  | { kind: 'palette'; template: Omit<WorkspaceBlock, 'id'> }
-  | { kind: 'canvas'; index: number }
+  | { kind: 'palette'; block: WorkspaceBlock }
+  | { kind: 'canvas'; index: number; block: WorkspaceBlock }
   | null
 >(null);
 const dropTargetIndex = ref<number | null>(null);
 
-const paletteTemplates: Record<BlockCategoryKey, Omit<WorkspaceBlock, 'id'>[]> = {
-  events: [
-    { category: 'events', opcode: 'when_program_starts', label: 'Quando o programa iniciar' },
-    { category: 'events', opcode: 'when_color_detected', label: 'Quando detectar cor', param: 'Vermelho' },
-    { category: 'events', opcode: 'set_rgb_color', label: 'Acender luz RGB na cor', param: 'Azul' },
-  ],
-  motion: [
-    { category: 'motion', opcode: 'move_distance', label: 'Mover para frente por', param: 20, unit: 'cm' },
-    { category: 'motion', opcode: 'turn_degrees', label: 'Girar à direita por', param: 90, unit: 'graus' },
-    { category: 'motion', opcode: 'turn_left', label: 'Virar à esquerda por', param: 90, unit: 'graus' },
-    { category: 'motion', opcode: 'set_move_speed', label: 'Definir velocidade de movimento para', param: 60, unit: '%' },
-  ],
-  motors: [
-    { category: 'motors', opcode: 'motor_run_rotations', label: 'Motor girar por', param: 1, unit: 'rotações' },
-  ],
-  sensors: [
-    { category: 'sensors', opcode: 'dist_less_than', label: 'Aguardar Distância <', param: 15, unit: 'cm' },
-    { category: 'sensors', opcode: 'color_is', label: 'Se Sensor de Cor for', param: 'Preto' },
-    { category: 'sensors', opcode: 'set_chameleon_mode', label: 'Modo Camaleão (LED = Cor do piso)', param: 'Ativado' },
-  ],
-  control: [
-    { category: 'control', opcode: 'wait_seconds', label: 'Esperar', param: 1, unit: 'segundos' },
-    { category: 'control', opcode: 'repeat_times', label: 'Repetir próximos blocos', param: 4, unit: 'vezes' },
-  ],
-  operators: [
-    { category: 'operators', opcode: 'math_add', label: 'Somar ao acumulador +', param: 10 },
-  ],
-  variables: [
-    { category: 'variables', opcode: 'set_var', label: 'Definir [velocidade] para', param: 50 },
-  ],
-};
+provide(
+  'activeDraggedBlock',
+  computed(() => dragSource.value?.block ?? null)
+);
 
-function getCategoryColor(cat: BlockCategoryKey): string {
-  return categories.find((c) => c.key === cat)?.color ?? '#64748B';
+const staticBlocksByCategory = computed(() => {
+  const grouped: Record<string, BlockCatalogEntry[]> = {};
+  for (const cat of BLOCK_CATEGORIES) {
+    grouped[cat.key] = BLOCK_CATALOG.filter((b) => b.category === cat.key);
+  }
+  return grouped;
+});
+
+function setSectionRef(key: BlockCategoryKey, el: unknown) {
+  if (el instanceof HTMLElement) {
+    sectionRefs.value[key] = el;
+  }
 }
 
-function isColorBlock(opcode: string): boolean {
-  return COLOR_OPCODES.has(opcode);
+function scrollToCategory(key: BlockCategoryKey) {
+  selectedCategory.value = key;
+  const target = sectionRefs.value[key];
+  const container = paletteScrollRef.value;
+  if (!target || !container) return;
+
+  isProgrammaticScroll.value = true;
+  target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setTimeout(() => {
+    isProgrammaticScroll.value = false;
+  }, 450);
 }
 
-function getColorHex(name: string | number | undefined): string {
-  const str = String(name ?? 'Vermelho').toLowerCase();
-  return SPIKE_COLORS.find((c) => c.name.toLowerCase() === str)?.hex ?? '#ef4444';
+function onPaletteScroll() {
+  if (isProgrammaticScroll.value) return;
+  const container = paletteScrollRef.value;
+  if (!container) return;
+
+  const containerTop = container.getBoundingClientRect().top;
+  let bestKey: BlockCategoryKey = BLOCK_CATEGORIES[0].key;
+  let bestDist = Infinity;
+
+  for (const cat of BLOCK_CATEGORIES) {
+    const el = sectionRefs.value[cat.key];
+    if (!el) continue;
+    const top = el.getBoundingClientRect().top - containerTop;
+    // Seção mais próxima do topo visível
+    if (top <= 48 && Math.abs(top) < bestDist) {
+      bestDist = Math.abs(top);
+      bestKey = cat.key;
+    } else if (top > 48 && bestDist === Infinity) {
+      bestDist = top;
+      bestKey = cat.key;
+    }
+  }
+  selectedCategory.value = bestKey;
 }
 
-function selectBlockColor(blk: WorkspaceBlock, colorName: string) {
-  blk.param = colorName;
-  isSavedInSqlite.value = false;
-  openColorPickerId.value = null;
-}
-
-function addBlockToStack(tpl: Omit<WorkspaceBlock, 'id'>, insertAt?: number) {
-  const newBlock: WorkspaceBlock = {
-    ...tpl,
+function instantiateFromCatalog(entry: BlockCatalogEntry): WorkspaceBlock {
+  return {
     id: `blk-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+    category: entry.category,
+    opcode: entry.opcode,
+    label: entry.label,
+    shape: entry.shape,
+    param: entry.defaultParam,
+    unit: entry.defaultUnit,
+    fields: entry.defaultFields ? { ...entry.defaultFields } : undefined,
+    children: entry.shape === 'c_block' || entry.shape === 'e_block' ? [] : undefined,
+    elseChildren: entry.shape === 'e_block' ? [] : undefined,
   };
+}
+
+function instantiateDynamicBlock(partial: Omit<WorkspaceBlock, 'id'>): WorkspaceBlock {
+  return {
+    ...partial,
+    id: `blk-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+    fields: partial.fields ? { ...partial.fields } : undefined,
+  };
+}
+
+function addBlockToStack(blk: WorkspaceBlock, insertAt?: number) {
   if (insertAt !== undefined && insertAt >= 0 && insertAt <= scriptStack.value.length) {
-    scriptStack.value.splice(insertAt, 0, newBlock);
+    scriptStack.value.splice(insertAt, 0, blk);
   } else {
-    scriptStack.value.push(newBlock);
+    scriptStack.value.push(blk);
   }
   isSavedInSqlite.value = false;
-  emit('log', `[Canvas] Bloco '${tpl.opcode}' encaixado na pilha.`);
+  emit('log', `[Canvas] Bloco '${blk.label}' encaixado na pilha.`);
 }
 
 function removeBlock(id: string) {
@@ -142,33 +146,30 @@ function removeBlock(id: string) {
   isSavedInSqlite.value = false;
 }
 
-// ── Handlers de Drag-and-Drop (Paleta e Reordenação com Snapping) ──
-function onPaletteDragStart(e: DragEvent, tpl: Omit<WorkspaceBlock, 'id'>) {
-  dragSource.value = { kind: 'palette', template: tpl };
+// ── Drag-and-Drop Handlers ──
+function onPaletteDragStart(e: DragEvent, blk: WorkspaceBlock) {
+  dragSource.value = { kind: 'palette', block: blk };
   if (e.dataTransfer) {
     e.dataTransfer.effectAllowed = 'copy';
-    e.dataTransfer.setData('text/plain', tpl.opcode);
+    e.dataTransfer.setData('text/plain', blk.opcode);
   }
 }
 
-function onCanvasBlockDragStart(e: DragEvent, index: number) {
+function onCanvasDragStart(payload: { event: DragEvent; block: WorkspaceBlock; index: number }) {
   if (simState.value !== 'Idle') {
-    e.preventDefault();
+    payload.event.preventDefault();
     return;
   }
-  dragSource.value = { kind: 'canvas', index };
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', String(index));
+  dragSource.value = { kind: 'canvas', index: payload.index, block: payload.block };
+  if (payload.event.dataTransfer) {
+    payload.event.dataTransfer.effectAllowed = 'move';
+    payload.event.dataTransfer.setData('text/plain', payload.block.id);
   }
 }
 
 function onSlotDragOver(e: DragEvent, targetIndex: number) {
   if (!dragSource.value) return;
   e.preventDefault();
-  if (e.dataTransfer) {
-    e.dataTransfer.dropEffect = dragSource.value.kind === 'palette' ? 'copy' : 'move';
-  }
   dropTargetIndex.value = targetIndex;
 }
 
@@ -189,74 +190,337 @@ function onDropAt(e: DragEvent, targetIndex: number) {
   if (!src) return;
 
   if (src.kind === 'palette') {
-    addBlockToStack(src.template, targetIndex);
+    addBlockToStack(src.block, targetIndex);
     return;
   }
 
-  const fromIdx = src.index;
-  if (fromIdx === targetIndex || fromIdx + 1 === targetIndex) return;
+  const fromIdx = scriptStack.value.findIndex((b) => b.id === src.block.id);
+  if (fromIdx !== -1) {
+    if (fromIdx === targetIndex || fromIdx + 1 === targetIndex) return;
+    const [moved] = scriptStack.value.splice(fromIdx, 1);
+    if (!moved) return;
+    const adjustedTarget = fromIdx < targetIndex ? targetIndex - 1 : targetIndex;
+    scriptStack.value.splice(adjustedTarget, 0, moved);
+    isSavedInSqlite.value = false;
+  } else if (removeBlockFromTree(scriptStack.value, src.block.id)) {
+    scriptStack.value.splice(targetIndex, 0, src.block);
+    isSavedInSqlite.value = false;
+  }
+}
 
-  const [moved] = scriptStack.value.splice(fromIdx, 1);
-  const adjustedTarget = fromIdx < targetIndex ? targetIndex - 1 : targetIndex;
-  scriptStack.value.splice(adjustedTarget, 0, moved);
+function onDropChild(payload: {
+  event: DragEvent;
+  parentBlock: WorkspaceBlock;
+  branch: 'children' | 'elseChildren';
+  insertAt: number;
+}) {
+  const src = dragSource.value;
+  dragSource.value = null;
+  dropTargetIndex.value = null;
+  if (!src) return;
+
+  // Bloqueia auto-encaixe direto ou indireto (ancestralidade)
+  if (isSelfOrDescendant(src.block, payload.parentBlock.id)) {
+    emit('log', `[Canvas] Encaixe bloqueado: um bloco não pode ser solto dentro de si mesmo ou de seus filhos.`);
+    return;
+  }
+
+  const targetArr =
+    payload.branch === 'elseChildren'
+      ? (payload.parentBlock.elseChildren ??= [])
+      : (payload.parentBlock.children ??= []);
+
+  if (src.kind === 'palette') {
+    targetArr.splice(payload.insertAt, 0, src.block);
+    isSavedInSqlite.value = false;
+    emit('log', `[Canvas] Bloco '${src.block.label}' encaixado dentro de '${payload.parentBlock.label}'.`);
+  } else if (removeBlockFromTree(scriptStack.value, src.block.id)) {
+    targetArr.splice(payload.insertAt, 0, src.block);
+    isSavedInSqlite.value = false;
+    emit('log', `[Canvas] Bloco '${src.block.label}' movido para dentro de '${payload.parentBlock.label}'.`);
+  }
+}
+
+function removeBlockFromTree(list: WorkspaceBlock[], targetId: string): boolean {
+  const idx = list.findIndex((b) => b.id === targetId);
+  if (idx !== -1) {
+    list.splice(idx, 1);
+    return true;
+  }
+  for (const b of list) {
+    if (b.children && removeBlockFromTree(b.children, targetId)) return true;
+    if (b.elseChildren && removeBlockFromTree(b.elseChildren, targetId)) return true;
+  }
+  return false;
+}
+
+function onDropSlot(payload: {
+  event: DragEvent;
+  parentBlock: WorkspaceBlock;
+  slotName: string;
+  expectedShape: 'reporter' | 'boolean';
+}) {
+  const src = dragSource.value;
+  dragSource.value = null;
+  dropTargetIndex.value = null;
+  if (!src) return;
+
+  const blk = src.block;
+  if (isSelfOrDescendant(blk, payload.parentBlock.id)) {
+    emit('log', `[Canvas] Encaixe bloqueado: referência circular não permitida.`);
+    return;
+  }
+
+  if (src.kind === 'canvas') {
+    removeBlockFromTree(scriptStack.value, blk.id);
+  }
+
+  if (!payload.parentBlock.slots) {
+    payload.parentBlock.slots = {};
+  }
+  payload.parentBlock.slots[payload.slotName] = blk;
   isSavedInSqlite.value = false;
-  emit('log', `[Canvas] Bloco '${moved.opcode}' reposicionado para posição #${adjustedTarget + 1}.`);
+  emit('log', `[Canvas] '${blk.label}' encaixado no slot ${payload.slotName}.`);
+}
+
+function onClearSlot(payload: { parentBlock: WorkspaceBlock; slotName: string }) {
+  if (payload.parentBlock.slots) {
+    payload.parentBlock.slots[payload.slotName] = null;
+    isSavedInSqlite.value = false;
+  }
 }
 
 function onDragEnd() {
   dragSource.value = null;
   dropTargetIndex.value = null;
 }
+
+// ── Handlers dos Modais Dinâmicos ──
+function handleCreateVariable(name: string) {
+  const created = workspaceStore.addVariable(name);
+  if (created) emit('log', `[Variáveis] Variável '${created.name}' criada.`);
+}
+
+function handleCreateList(name: string) {
+  const created = workspaceStore.addList(name);
+  if (created) emit('log', `[Listas] Lista '${created.name}' criada.`);
+}
+
+function handleCreateMessage(name: string) {
+  workspaceStore.addMessage(name);
+  emit('log', `[Eventos] Mensagem '${name}' adicionada.`);
+}
+
+function handleCreateCustomBlock(payload: { name: string; segments: CustomBlockSegment[] }) {
+  const def = workspaceStore.addCustomBlock(payload.name, payload.segments);
+  emit('log', `[Meus Blocos] Bloco '${def.name}' criado e chapéu de definição inserido no canvas.`);
+}
+
+// Blocos dinâmicos de Variáveis
+const dynamicVariableBlocks = computed<Omit<WorkspaceBlock, 'id'>[]>(() => {
+  if (definitions.value.variables.length === 0) return [];
+  const first = definitions.value.variables[0].name;
+  return [
+    {
+      category: 'variables',
+      opcode: 'var_set',
+      shape: 'stack',
+      label: `altera ${first} para 0`,
+      fields: { variable: first, value: 0 },
+    },
+    {
+      category: 'variables',
+      opcode: 'var_change',
+      shape: 'stack',
+      label: `adiciona a ${first} o valor 1`,
+      fields: { variable: first, value: 1 },
+    },
+  ];
+});
+
+// Blocos dinâmicos de Listas
+const dynamicListBlocks = computed<Omit<WorkspaceBlock, 'id'>[]>(() => {
+  if (definitions.value.lists.length === 0) return [];
+  const first = definitions.value.lists[0].name;
+  const items: Omit<WorkspaceBlock, 'id'>[] = [
+    { category: 'lists', opcode: 'list_add', shape: 'stack', label: `acrescenta [uma coisa] a ${first}`, fields: { list: first, item: 'uma coisa' } },
+    { category: 'lists', opcode: 'list_delete', shape: 'stack', label: `remove [1] de ${first}`, fields: { list: first, index: 1 } },
+    { category: 'lists', opcode: 'list_clear', shape: 'stack', label: `remove tudo de ${first}`, fields: { list: first } },
+    { category: 'lists', opcode: 'list_insert', shape: 'stack', label: `insere [uma coisa] como [1] de ${first}`, fields: { list: first, item: 'uma coisa', index: 1 } },
+    { category: 'lists', opcode: 'list_replace', shape: 'stack', label: `substitui [1] de ${first} por [uma coisa]`, fields: { list: first, index: 1, item: 'uma coisa' } },
+    { category: 'lists', opcode: 'list_item_at', shape: 'reporter', label: `[1] de ${first}`, fields: { list: first, index: 1 } },
+    { category: 'lists', opcode: 'list_index_of', shape: 'reporter', label: `número do item [uma coisa] em ${first}`, fields: { list: first, item: 'uma coisa' } },
+    { category: 'lists', opcode: 'list_length', shape: 'reporter', label: `o comprimento de ${first}`, fields: { list: first } },
+    { category: 'lists', opcode: 'list_contains', shape: 'boolean', label: `${first} contém [uma coisa]`, fields: { list: first, item: 'uma coisa' } },
+  ];
+  return items;
+});
 </script>
 
 <template>
   <div class="block-editor-root">
     <aside class="spike-sidebar">
+      <!-- Barra vertical de navegação rápida -->
       <div class="category-rail">
         <button
-          v-for="cat in categories"
+          v-for="cat in BLOCK_CATEGORIES"
           :key="cat.key"
           class="cat-item"
           :class="{ selected: selectedCategory === cat.key }"
-          @click="selectedCategory = cat.key"
+          @click="scrollToCategory(cat.key)"
         >
           <span class="cat-swatch" :style="{ backgroundColor: cat.color }">{{ cat.icon }}</span>
           <span class="cat-label">{{ cat.label }}</span>
         </button>
       </div>
 
-      <div class="palette-drawer">
-        <header class="drawer-header">
-          <span>{{ categories.find((c) => c.key === selectedCategory)?.label }}</span>
-          <small class="kit-pill">
-            {{ currentProject.robot_model === 'SPIKE_ESSENTIAL' ? 'Essencial' : 'Prime' }}
-          </small>
-        </header>
-        <div class="drawer-list">
-          <div
-            v-for="tpl in paletteTemplates[selectedCategory]"
-            :key="tpl.opcode"
-            class="block-chip"
-            draggable="true"
-            :style="{ '--blk-color': getCategoryColor(tpl.category) }"
-            title="Arraste para o canvas ou clique para adicionar"
-            @dragstart="onPaletteDragStart($event, tpl)"
-            @dragend="onDragEnd"
-            @click="addBlockToStack(tpl)"
-          >
-            <span>{{ tpl.label }}</span>
-            <span
-              v-if="isColorBlock(tpl.opcode)"
-              class="chip-color-dot"
-              :style="{ backgroundColor: getColorHex(tpl.param) }"
-            ></span>
-            <strong v-else-if="tpl.param !== undefined" class="chip-input">{{ tpl.param }}</strong>
-            <small v-if="tpl.unit">{{ tpl.unit }}</small>
-          </div>
+      <!-- Paleta contínua com Scroll-Spy -->
+      <div ref="paletteScrollRef" class="palette-scroll" @scroll="onPaletteScroll">
+        <div class="palette-top-badge">
+          Kit: <strong>{{ currentProject.robot_model === 'SPIKE_ESSENTIAL' ? 'Essencial' : 'Prime' }}</strong>
         </div>
+
+        <section
+          v-for="cat in BLOCK_CATEGORIES"
+          :key="cat.key"
+          :ref="(el) => setSectionRef(cat.key, el)"
+          class="palette-section"
+        >
+          <h4 class="section-title" :style="{ borderLeftColor: cat.color }">
+            {{ cat.label }}
+          </h4>
+
+          <!-- Categorias estáticas A..H -->
+          <template v-if="cat.key !== 'variables' && cat.key !== 'lists' && cat.key !== 'my_blocks'">
+            <div class="section-blocks">
+              <div
+                v-for="entry in staticBlocksByCategory[cat.key]"
+                :key="entry.opcode"
+                class="palette-chip"
+                :class="`chip-${entry.shape}`"
+                :style="{ '--blk-color': cat.color }"
+                draggable="true"
+                title="Arraste para o canvas ou clique para adicionar"
+                @dragstart="onPaletteDragStart($event, instantiateFromCatalog(entry))"
+                @dragend="onDragEnd"
+                @click="addBlockToStack(instantiateFromCatalog(entry))"
+              >
+                {{ entry.label }}
+              </div>
+            </div>
+          </template>
+
+          <!-- Seção I: Variáveis -->
+          <template v-else-if="cat.key === 'variables'">
+            <button type="button" class="btn-create-dynamic" @click="activeModal = 'variable'">
+              + Criar uma Variável
+            </button>
+
+            <div v-if="definitions.variables.length > 0" class="dynamic-monitors">
+              <label v-for="v in definitions.variables" :key="v.id" class="monitor-chip">
+                <input v-model="v.monitored" type="checkbox" @change="isSavedInSqlite = false" />
+                <span class="var-pill" :style="{ backgroundColor: cat.color }">{{ v.name }}</span>
+                <small>= {{ v.value }}</small>
+              </label>
+            </div>
+
+            <div class="section-blocks">
+              <div
+                v-for="(tpl, i) in dynamicVariableBlocks"
+                :key="i"
+                class="palette-chip"
+                :style="{ '--blk-color': cat.color }"
+                draggable="true"
+                @dragstart="onPaletteDragStart($event, instantiateDynamicBlock(tpl))"
+                @dragend="onDragEnd"
+                @click="addBlockToStack(instantiateDynamicBlock(tpl))"
+              >
+                {{ tpl.label }}
+              </div>
+            </div>
+          </template>
+
+          <!-- Seção I: Listas -->
+          <template v-else-if="cat.key === 'lists'">
+            <button type="button" class="btn-create-dynamic" @click="activeModal = 'list'">
+              + Criar uma Lista
+            </button>
+
+            <div v-if="definitions.lists.length > 0" class="dynamic-monitors">
+              <label v-for="l in definitions.lists" :key="l.id" class="monitor-chip">
+                <input v-model="l.monitored" type="checkbox" @change="isSavedInSqlite = false" />
+                <span class="var-pill" :style="{ backgroundColor: cat.color }">{{ l.name }}</span>
+                <small>[{{ l.items.length }}]</small>
+              </label>
+            </div>
+
+            <div class="section-blocks">
+              <div
+                v-for="(tpl, i) in dynamicListBlocks"
+                :key="i"
+                class="palette-chip"
+                :class="`chip-${tpl.shape ?? 'stack'}`"
+                :style="{ '--blk-color': cat.color }"
+                draggable="true"
+                @dragstart="onPaletteDragStart($event, instantiateDynamicBlock(tpl))"
+                @dragend="onDragEnd"
+                @click="addBlockToStack(instantiateDynamicBlock(tpl))"
+              >
+                {{ tpl.label }}
+              </div>
+            </div>
+          </template>
+
+          <!-- Seção J: Meus Blocos -->
+          <template v-else-if="cat.key === 'my_blocks'">
+            <button type="button" class="btn-create-dynamic" @click="activeModal = 'custom_block'">
+              + Criar um Bloco
+            </button>
+
+            <div class="section-blocks">
+              <div
+                v-for="def in definitions.customBlocks"
+                :key="def.id"
+                class="palette-chip"
+                :style="{ '--blk-color': cat.color }"
+                draggable="true"
+                @dragstart="
+                  onPaletteDragStart(
+                    $event,
+                    instantiateDynamicBlock({
+                      category: 'my_blocks',
+                      opcode: 'my_block_call',
+                      shape: 'stack',
+                      label: def.name,
+                      customBlockId: def.id,
+                    })
+                  )
+                "
+                @dragend="onDragEnd"
+                @click="
+                  addBlockToStack(
+                    instantiateDynamicBlock({
+                      category: 'my_blocks',
+                      opcode: 'my_block_call',
+                      shape: 'stack',
+                      label: def.name,
+                      customBlockId: def.id,
+                    })
+                  )
+                "
+              >
+                {{ def.name }}
+                <span v-for="seg in def.segments" :key="seg.id" class="cb-mini-arg">
+                  {{ seg.kind === 'label' ? seg.text : seg.kind === 'boolean' ? `<${seg.text}>` : `(${seg.text})` }}
+                </span>
+              </div>
+            </div>
+          </template>
+        </section>
       </div>
     </aside>
 
+    <!-- Área de Programação (Canvas) -->
     <div
       class="block-canvas"
       @dragover="onCanvasDragOver"
@@ -265,7 +529,7 @@ function onDragEnd() {
       <div class="canvas-hud">
         <span>
           Canvas Principal · Motores <strong>{{ robotConfig.left_motor_port }}+{{ robotConfig.right_motor_port }}</strong>
-          ({{ degreesPerCm }}°/cm) · <em>Arraste blocos para reorganizar</em>
+          ({{ degreesPerCm }}°/cm) · <em>Arraste blocos, C-Blocks ou slots</em>
         </span>
         <span v-if="compileDiagnostics.length > 0" class="diag-badge">
           ⚠️ {{ compileDiagnostics[0].message }}
@@ -274,7 +538,6 @@ function onDragEnd() {
 
       <div class="block-stack-container">
         <template v-for="(blk, idx) in scriptStack" :key="blk.id">
-          <!-- Zona de encaixe (snapping) antes do bloco -->
           <div
             class="snap-zone"
             :class="{ active: dropTargetIndex === idx }"
@@ -284,88 +547,19 @@ function onDragEnd() {
             <span v-if="dropTargetIndex === idx" class="snap-hint">Encaixar aqui</span>
           </div>
 
-          <div
-            class="puzzle-block"
-            draggable="true"
-            :class="{
-              'is-hat': blk.category === 'events',
-              'is-executing': activeBlockIndex === idx,
-              'is-dragging': dragSource?.kind === 'canvas' && dragSource.index === idx,
-            }"
-            :style="{ '--blk-color': getCategoryColor(blk.category) }"
-            @dragstart="onCanvasBlockDragStart($event, idx)"
-            @dragover="onSlotDragOver($event, idx + 1)"
-            @drop="onDropAt($event, idx + 1)"
-            @dragend="onDragEnd"
-          >
-            <div class="block-content">
-              <span class="drag-handle" title="Arrastar bloco">⋮⋮</span>
-              <span class="block-index">#{{ idx + 1 }}</span>
-              <span class="block-text">{{ blk.label }}</span>
-
-              <!-- Seletor Visual de Cores (Swatches) -->
-              <div v-if="isColorBlock(blk.opcode)" class="color-picker-wrap">
-                <button
-                  type="button"
-                  class="color-swatch-btn"
-                  :title="`Cor selecionada: ${blk.param}`"
-                  @click.stop="openColorPickerId = openColorPickerId === blk.id ? null : blk.id"
-                >
-                  <span class="swatch-circle" :style="{ backgroundColor: getColorHex(blk.param) }"></span>
-                  <span class="swatch-name">{{ blk.param }}</span>
-                  <span class="swatch-caret">▾</span>
-                </button>
-
-                <div v-if="openColorPickerId === blk.id" class="color-popover" @click.stop>
-                  <button
-                    v-for="sw in SPIKE_COLORS"
-                    :key="sw.name"
-                    type="button"
-                    class="swatch-option"
-                    :class="{ selected: String(blk.param) === sw.name }"
-                    :title="sw.name"
-                    @click="selectBlockColor(blk, sw.name)"
-                  >
-                    <span class="swatch-circle lg" :style="{ backgroundColor: sw.hex }"></span>
-                  </button>
-                </div>
-              </div>
-
-              <!-- Seletor Ativado/Desativado para Modo Camaleão -->
-              <select
-                v-else-if="blk.opcode === 'set_chameleon_mode'"
-                v-model="blk.param"
-                class="block-select-input"
-                @mousedown.stop
-                @change="isSavedInSqlite = false"
-              >
-                <option value="Ativado">Ativado</option>
-                <option value="Desativado">Desativado</option>
-              </select>
-
-              <!-- Input numérico padrão -->
-              <input
-                v-else-if="blk.param !== undefined"
-                v-model="blk.param"
-                class="block-field-input"
-                @mousedown.stop
-                @input="isSavedInSqlite = false"
-              />
-
-              <span v-if="blk.unit" class="block-unit">{{ blk.unit }}</span>
-              <button
-                v-if="scriptStack.length > 1 || idx > 0"
-                class="block-remove"
-                title="Remover bloco"
-                @click.stop="removeBlock(blk.id)"
-              >
-                ×
-              </button>
-            </div>
-          </div>
+          <CanvasBlockNode
+            :block="blk"
+            :index="idx"
+            :is-executing="activeBlockIndex === idx"
+            @remove="removeBlock"
+            @drag-start="onCanvasDragStart"
+            @drop-child="onDropChild"
+            @drop-slot="onDropSlot"
+            @clear-slot="onClearSlot"
+            @open-new-message="activeModal = 'message'"
+          />
         </template>
 
-        <!-- Zona de encaixe final -->
         <div
           class="snap-zone end-zone"
           :class="{ active: dropTargetIndex === scriptStack.length }"
@@ -376,6 +570,15 @@ function onDragEnd() {
         </div>
       </div>
     </div>
+
+    <BlockCreationModals
+      :modal-kind="activeModal"
+      @close="activeModal = null"
+      @create-variable="handleCreateVariable"
+      @create-list="handleCreateList"
+      @create-message="handleCreateMessage"
+      @create-custom-block="handleCreateCustomBlock"
+    />
   </div>
 </template>
 
@@ -386,19 +589,20 @@ function onDragEnd() {
   height: 100%;
 }
 .spike-sidebar {
-  width: 280px;
+  width: 310px;
   background: #181c26;
   border-right: 1px solid #2b3142;
   display: flex;
 }
 .category-rail {
-  width: 76px;
+  width: 78px;
   background: #14171f;
   border-right: 1px solid #252b3b;
-  padding: 10px 6px;
+  padding: 8px 5px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 5px;
+  overflow-y: auto;
 }
 .cat-item {
   background: transparent;
@@ -407,84 +611,126 @@ function onDragEnd() {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 7px 4px;
+  gap: 3px;
+  padding: 6px 3px;
   border-radius: 8px;
   cursor: pointer;
-  font-size: 10px;
+  font-size: 9.5px;
+  text-align: center;
 }
 .cat-item.selected {
   background: #23293a;
   border-color: #3b4254;
   color: #fff;
+  font-weight: 700;
 }
 .cat-swatch {
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   border-radius: 50%;
   display: grid;
   place-items: center;
-  font-size: 13px;
+  font-size: 12px;
 }
-.palette-drawer {
+.palette-scroll {
   flex: 1;
+  overflow-y: auto;
+  padding: 10px;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  gap: 14px;
 }
-.drawer-header {
-  padding: 12px 14px;
+.palette-top-badge {
+  font-size: 11px;
+  color: #94a3b8;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #252b3b;
+}
+.palette-top-badge strong {
+  color: #93c5fd;
+}
+.palette-section {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  scroll-margin-top: 8px;
+}
+.section-title {
   font-size: 12px;
   font-weight: 700;
-  border-bottom: 1px solid #252b3b;
-  color: #cbd5e1;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  color: #e2e8f0;
+  border-left: 4px solid #3b82f6;
+  padding-left: 8px;
 }
-.kit-pill {
-  background: #262c3a;
-  color: #93c5fd;
-  padding: 2px 7px;
-  border-radius: 999px;
-  font-size: 10px;
-}
-.drawer-list {
-  padding: 12px;
+.section-blocks {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  overflow-y: auto;
+  gap: 6px;
 }
-.block-chip {
+.palette-chip {
   background: var(--blk-color);
   color: #fff;
-  padding: 9px 11px;
-  border-radius: 8px;
-  font-size: 12px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  font-size: 11.5px;
   font-weight: 600;
   cursor: grab;
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.palette-chip.chip-hat {
+  border-top-left-radius: 16px;
+  border-top-right-radius: 16px;
+}
+.palette-chip.chip-reporter {
+  border-radius: 999px;
+}
+.palette-chip.chip-boolean {
+  clip-path: polygon(10px 0%, calc(100% - 10px) 0%, 100% 50%, calc(100% - 10px) 100%, 10px 100%, 0% 50%);
+  padding: 7px 14px;
+}
+.btn-create-dynamic {
+  background: #23293a;
+  border: 1px dashed #475569;
+  color: #f8fafc;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.btn-create-dynamic:hover {
+  border-color: #38bdf8;
+  color: #38bdf8;
+}
+.dynamic-monitors {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.monitor-chip {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
-  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.35);
+  font-size: 11px;
+  color: #cbd5e1;
+  cursor: pointer;
 }
-.block-chip:active {
-  cursor: grabbing;
-}
-.chip-input {
-  background: rgba(255, 255, 255, 0.9);
-  color: #0f172a;
-  padding: 1px 6px;
+.var-pill {
+  padding: 2px 8px;
   border-radius: 999px;
+  color: #fff;
+  font-weight: 700;
   font-size: 11px;
 }
-.chip-color-dot {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 2px solid #fff;
+.cb-mini-arg {
+  background: rgba(0, 0, 0, 0.25);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
 }
 .block-canvas {
   flex: 1;
@@ -527,7 +773,7 @@ function onDragEnd() {
   padding-left: 12px;
 }
 .snap-zone.end-zone {
-  height: 36px;
+  height: 40px;
 }
 .snap-zone.active {
   height: 22px;
@@ -539,137 +785,5 @@ function onDragEnd() {
   font-size: 10px;
   font-weight: 700;
   color: #93c5fd;
-}
-.puzzle-block {
-  position: relative;
-  background: var(--blk-color);
-  color: #fff;
-  padding: 9px 14px;
-  border-radius: 8px;
-  min-width: 340px;
-  box-shadow: 0 3px 0 rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  cursor: grab;
-  transition: transform 0.12s, box-shadow 0.12s, opacity 0.12s;
-}
-.puzzle-block.is-hat {
-  border-top-left-radius: 18px;
-  border-top-right-radius: 18px;
-  margin-bottom: 2px;
-}
-.puzzle-block.is-executing {
-  outline: 3px solid #fde047;
-  box-shadow: 0 0 18px rgba(250, 204, 21, 0.65);
-  transform: translateX(6px);
-}
-.puzzle-block.is-dragging {
-  opacity: 0.45;
-}
-.block-content {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  font-weight: 600;
-}
-.drag-handle {
-  opacity: 0.6;
-  font-size: 12px;
-  cursor: grab;
-}
-.block-index {
-  font-size: 10px;
-  opacity: 0.75;
-}
-.block-field-input {
-  width: 58px;
-  border: 1px solid rgba(15, 23, 42, 0.2);
-  border-radius: 999px;
-  padding: 2px 8px;
-  text-align: center;
-  font-weight: 700;
-  font-size: 12px;
-  background-color: #ffffff;
-  color: #0f172a;
-}
-.block-select-input {
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 999px;
-  padding: 2px 10px;
-  font-weight: 700;
-  font-size: 12px;
-  background-color: #1e293b;
-  color: #f8fafc;
-  cursor: pointer;
-}
-.block-unit {
-  font-size: 12px;
-  opacity: 0.9;
-}
-.block-remove {
-  margin-left: auto;
-  background: rgba(0, 0, 0, 0.25);
-  border: none;
-  color: #fff;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  cursor: pointer;
-}
-.color-picker-wrap {
-  position: relative;
-}
-.color-swatch-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  background: rgba(15, 23, 42, 0.85);
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  color: #fff;
-  padding: 2px 8px 2px 5px;
-  border-radius: 999px;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 600;
-}
-.swatch-circle {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 1.5px solid rgba(255, 255, 255, 0.8);
-  display: inline-block;
-}
-.swatch-circle.lg {
-  width: 20px;
-  height: 20px;
-}
-.swatch-caret {
-  font-size: 10px;
-  opacity: 0.8;
-}
-.color-popover {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 30;
-  background: #181c26;
-  border: 1px solid #334155;
-  border-radius: 10px;
-  padding: 8px;
-  display: flex;
-  gap: 6px;
-  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
-}
-.swatch-option {
-  background: transparent;
-  border: 2px solid transparent;
-  border-radius: 50%;
-  padding: 2px;
-  cursor: pointer;
-  display: grid;
-  place-items: center;
-}
-.swatch-option.selected {
-  border-color: #38bdf8;
 }
 </style>

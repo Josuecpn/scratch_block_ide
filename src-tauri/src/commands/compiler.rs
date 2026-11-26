@@ -1,14 +1,26 @@
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct BlockInputDto {
     pub id: String,
     pub category: String,
     pub opcode: String,
     pub label: String,
-    pub param: Option< serde_json::Value >,
+    pub param: Option<serde_json::Value>,
     pub unit: Option<String>,
+    #[serde(default)]
+    pub shape: Option<String>,
+    #[serde(default)]
+    pub fields: Option<serde_json::Value>,
+    #[serde(default)]
+    pub slots: Option<serde_json::Value>,
+    #[serde(default)]
+    pub children: Option<Vec<BlockInputDto>>,
+    #[serde(default, rename = "elseChildren")]
+    pub else_children: Option<Vec<BlockInputDto>>,
+    #[serde(default, rename = "customBlockId")]
+    pub custom_block_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -521,6 +533,7 @@ mod tests {
                 label: "Quando iniciar".into(),
                 param: None,
                 unit: None,
+                ..Default::default()
             },
             BlockInputDto {
                 id: "b2".into(),
@@ -529,6 +542,7 @@ mod tests {
                 label: "Velocidade".into(),
                 param: Some(serde_json::json!(70)),
                 unit: Some("%".into()),
+                ..Default::default()
             },
             BlockInputDto {
                 id: "b3".into(),
@@ -537,6 +551,7 @@ mod tests {
                 label: "Mover".into(),
                 param: Some(serde_json::json!(20)),
                 unit: Some("cm".into()),
+                ..Default::default()
             },
             BlockInputDto {
                 id: "b4".into(),
@@ -545,6 +560,7 @@ mod tests {
                 label: "Girar".into(),
                 param: Some(serde_json::json!(90)),
                 unit: Some("graus".into()),
+                ..Default::default()
             },
         ]
     }

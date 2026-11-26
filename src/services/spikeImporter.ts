@@ -94,6 +94,29 @@ async function readZipArchive(bytes: Uint8Array): Promise<Map<string, Uint8Array
   return entries;
 }
 
+function rehydrateLosslessBlocks(rawBlocks: WorkspaceBlock[], prefix = 'blk-rt'): WorkspaceBlock[] {
+  return rawBlocks.map((b, idx) => {
+    const clone: WorkspaceBlock = {
+      ...b,
+      id: `${prefix}-${Date.now()}-${idx}-${Math.floor(Math.random() * 10000)}`,
+      fields: b.fields ? { ...b.fields } : undefined,
+      slots: b.slots
+        ? Object.fromEntries(
+            Object.entries(b.slots).map(([k, v]) => [
+              k,
+              v ? rehydrateLosslessBlocks([v], `${prefix}-slot`)[0] : null,
+            ])
+          )
+        : undefined,
+      children: b.children ? rehydrateLosslessBlocks(b.children, `${prefix}-ch`) : undefined,
+      elseChildren: b.elseChildren
+        ? rehydrateLosslessBlocks(b.elseChildren, `${prefix}-el`)
+        : undefined,
+    };
+    return clone;
+  });
+}
+
 function mapPythonColorToPt(token: string): string {
   const lower = token.toLowerCase();
   if (lower.includes('black') || lower.includes('preto') || lower === '0') return 'Preto';
@@ -173,16 +196,24 @@ export function parsePythonToBlocks(
       continue;
     }
 
-    const speedSpike = /velocidade_padrao\s*=\s*(\d+(?:\.\d+)?)/.exec(line);
+    const speedSpike =
+      /(?:velocidade_padrao\s*=\s*|motor_pair\.set_default_speed\(|set_movement_speed\()(\d+(?:\.\d+)?)/.exec(
+        line
+      );
     if (speedSpike) {
-      const pct = Math.max(5, Math.min(100, Math.round(Number(speedSpike[1]) / 10)));
+      const rawNum = Number(speedSpike[1]);
+      const pct = line.includes('velocidade_padrao')
+        ? Math.max(5, Math.min(100, Math.round(rawNum / 10)))
+        : Math.max(5, Math.min(100, Math.round(rawNum)));
       blocks.push({
         id: makeBlockId(idx++),
         category: 'motion',
         opcode: 'set_move_speed',
-        label: 'Definir velocidade de movimento para',
+        shape: 'stack',
+        label: 'Definir velocidade de movimento a',
         param: pct,
         unit: '%',
+        fields: { speed: pct },
       });
       continue;
     }
@@ -456,13 +487,16 @@ export function parseSb3ToBlocks(projectJsonText: string): {
         });
       } else if (op.includes('motorSetSpeed') || op.includes('movementSpeed')) {
         const spd = Number(extractInputVal(b, allBlocks, 'SPEED', '60'));
+        const clamped = Number.isFinite(spd) ? Math.max(0, Math.min(100, spd)) : 60;
         result.push({
           id: makeBlockId(idx++),
           category: 'motion',
           opcode: 'set_move_speed',
-          label: 'Definir velocidade de movimento para',
-          param: Number.isFinite(spd) ? Math.max(5, Math.min(100, spd)) : 60,
+          shape: 'stack',
+          label: 'Definir velocidade de movimento a',
+          param: clamped,
           unit: '%',
+          fields: { speed: clamped },
         });
       } else if (op.includes('motorTurnForDirection')) {
         const val = Number(extractInputVal(b, allBlocks, 'VALUE', '1'));
@@ -512,15 +546,18 @@ export function parseSb3ToBlocks(projectJsonText: string): {
       } else if (op === 'flippermove_move' || op.includes('move_move')) {
         const val = Number(extractInputVal(b, allBlocks, 'VALUE', extractInputVal(b, allBlocks, 'DISTANCE', '10')));
         const dir = extractInputVal(b, allBlocks, 'DIRECTION', 'forward').toLowerCase();
-        const unit = extractFieldVal(b, 'UNIT', 'cm');
-        const cm = convertDistanceToCm(Number.isFinite(val) ? val : 10, unit);
+        const unit = extractFieldVal(b, 'UNIT', 'cm').toLowerCase();
+        const rawVal = Number.isFinite(val) ? val : 10;
+        const cm = unit === 'cm' ? rawVal : convertDistanceToCm(rawVal, unit);
         result.push({
           id: makeBlockId(idx++),
           category: 'motion',
           opcode: 'move_distance',
+          shape: 'stack',
           label: 'Mover para frente por',
           param: dir.includes('back') ? -Math.abs(cm) : cm,
-          unit: 'cm',
+          unit: unit === 'inches' ? 'polegadas' : 'cm',
+          fields: { direction: dir.includes('back') ? 'backward' : 'forward', value: cm, unit: 'cm' },
         });
       } else if (op === 'flippermove_steer' || op.includes('steer')) {
         const steering = Number(extractInputVal(b, allBlocks, 'STEERING', '0'));
@@ -695,6 +732,31 @@ export async function importSpikeFile(file: File): Promise<ImportResult> {
       hwStr.includes('smallhub') || lowerName.includes('essential')
         ? 'SPIKE_ESSENTIAL'
         : 'SPIKE_PRIME';
+
+    // Prioriza roboblocks.json embutido para restauração 100% fiel (round-trip 1:1)
+    const rbMetaRaw = entries.get('roboblocks.json');
+    if (rbMetaRaw) {
+      try {
+        const rbMeta = JSON.parse(decoder.decode(rbMetaRaw)) as {
+          robotModel?: RobotKitModel;
+          blocks?: WorkspaceBlock[];
+        };
+        if (Array.isArray(rbMeta.blocks) && rbMeta.blocks.length > 0) {
+          const restored = rehydrateLosslessBlocks(rbMeta.blocks);
+          return {
+            success: true,
+            sourceFormat: manifest.type === 'python' ? 'llsp3_python' : 'llsp3_blocks',
+            blocks: restored,
+            detectedKit: rbMeta.robotModel ?? detectedKit,
+            projectName: manifest.name,
+            warnings: [],
+            message: `[Importer] Projeto '${file.name}' restaurado com fidelidade 1:1 (${restored.length} blocos).`,
+          };
+        }
+      } catch {
+        // Fallback para leitura padrão .sb3 / .py
+      }
+    }
 
     if (manifest.type === 'python' || entries.has('projectbody.json')) {
       const bodyRaw = entries.get('projectbody.json');

@@ -24,6 +24,18 @@ pub fn get_migrations() -> Vec<Migration> {
             sql: include_str!("../migrations/003_robot_visual_and_arena.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 4,
+            description: "add_canvas_definitions_json",
+            sql: include_str!("../migrations/004_custom_definitions.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 5,
+            description: "migrate_legacy_blocks_and_defaults",
+            sql: include_str!("../migrations/005_migrate_legacy_blocks.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 

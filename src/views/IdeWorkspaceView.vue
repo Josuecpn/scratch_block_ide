@@ -1,11 +1,16 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted } from 'vue';
-import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { storeToRefs } from 'pinia';
 import { useWorkspaceStore, type WorkspaceBlock } from '../stores/workspace.store';
 import { useSimulationStore } from '../stores/simulation.store';
 import { isTauriRuntime, type RobotKitModel } from '../services/database';
+import {
+  runDifferentialMotion,
+  runTimedWait,
+  runWaitUntil,
+  startContinuousMotion,
+} from '../services/robotKinematics';
 import {
   compileToMicroPython,
   exportSpikeProject,
@@ -21,15 +26,6 @@ import BlockEditorPanel from '../components/BlockEditorPanel.vue';
 import SimViewport3D from '../components/SimViewport3D.vue';
 import ArenaEditorPanel from '../components/ArenaEditorPanel.vue';
 import RobotCustomizerPanel from '../components/RobotCustomizerPanel.vue';
-
-interface SimStepResponse {
-  next_x: number;
-  next_y: number;
-  next_heading: number;
-  left_motor_pct: number;
-  right_motor_pct: number;
-  log_message: string;
-}
 
 const workspaceStore = useWorkspaceStore();
 const simulationStore = useSimulationStore();
@@ -47,7 +43,7 @@ const {
   availablePorts,
 } = storeToRefs(workspaceStore);
 
-const { simState, activeBlockIndex, robotPose, sensors, ledColor, detectedColorName, chameleonMode } =
+const { simState, activeBlockIndex, sensors, ledColor, detectedColorName, chameleonMode } =
   storeToRefs(simulationStore);
 
 const isDraggingSplitter = ref(false);
@@ -79,8 +75,6 @@ const logs = ref<string[]>([
   '[SQLite3] Banco local sqlite:roboblocks.db pronto.',
   `[Workspace] Projeto carregado: ${currentProject.value.name}`,
 ]);
-
-let simInterval: ReturnType<typeof setInterval> | null = null;
 
 function appendLog(msg: string) {
   logs.value.push(msg);
@@ -287,87 +281,347 @@ async function handleStopHub() {
   }
 }
 
-async function executeCurrentBlockStep(blk: WorkspaceBlock) {
+function evaluateBooleanSlot(condBlk: WorkspaceBlock | null | undefined): boolean {
+  if (!condBlk) return false;
+  const cf = condBlk.fields ?? {};
+  if (condBlk.opcode === 'color_is') {
+    const exp = String(cf.color ?? condBlk.param ?? '').trim().toLowerCase();
+    return detectedColorName.value.trim().toLowerCase() === exp;
+  }
+  if (condBlk.opcode === 'op_not') {
+    return !evaluateBooleanSlot(condBlk.slots?.A);
+  }
+  if (condBlk.opcode === 'op_and') {
+    return evaluateBooleanSlot(condBlk.slots?.A) && evaluateBooleanSlot(condBlk.slots?.B);
+  }
+  if (condBlk.opcode === 'op_or') {
+    return evaluateBooleanSlot(condBlk.slots?.A) || evaluateBooleanSlot(condBlk.slots?.B);
+  }
+  return false;
+}
+
+async function executeCurrentBlockStep(
+  blk: WorkspaceBlock,
+  allowStep = false,
+  execStack = new Set<string>()
+): Promise<boolean> {
+  if (execStack.size > 25 || execStack.has(blk.id)) {
+    appendLog(`[VM Aviso] Referência circular ou profundidade máxima atingida no bloco '${blk.label}'.`);
+    return true;
+  }
+  execStack.add(blk.id);
+  try {
+    return await executeCurrentBlockStepInner(blk, allowStep, execStack);
+  } finally {
+    execStack.delete(blk.id);
+  }
+}
+
+async function executeCurrentBlockStepInner(
+  blk: WorkspaceBlock,
+  allowStep = false,
+  execStack = new Set<string>()
+): Promise<boolean> {
+  const f = blk.fields ?? {};
+
   if (blk.opcode === 'set_rgb_color') {
-    const col = String(blk.param ?? 'Azul');
+    const col = String(f.color ?? blk.param ?? 'Azul');
     simulationStore.setChameleonMode(false);
     simulationStore.setLedColor(col);
     appendLog(`[RGB 3D] Luz do Hub acesa na cor '${col}' (${ledColor.value}).`);
-    return;
+    return true;
   }
 
   if (blk.opcode === 'set_chameleon_mode') {
-    const enabled = String(blk.param ?? 'Ativado') !== 'Desativado';
+    const enabled = String(f.enabled ?? blk.param ?? 'Ativado') !== 'Desativado';
     simulationStore.setChameleonMode(enabled);
     appendLog(
       `[Modo Camaleão] ${enabled ? `Ativado — LED espelhando piso (${detectedColorName.value})` : 'Desativado'}.`
     );
-    return;
+    return true;
   }
 
   if (blk.opcode === 'when_color_detected' || blk.opcode === 'color_is') {
-    const expected = String(blk.param ?? 'Vermelho').trim().toLowerCase();
+    const expectedCol = String(f.color ?? blk.param ?? 'Vermelho');
+    const expected = expectedCol.trim().toLowerCase();
     const actual = detectedColorName.value.trim().toLowerCase();
     const matched = actual === expected;
     if (matched && blk.opcode === 'color_is') {
-      simulationStore.setLedColor(String(blk.param ?? 'Vermelho'));
+      simulationStore.setLedColor(expectedCol);
     }
     appendLog(
-      `[Sensor Cor 3D] Leitura='${detectedColorName.value}' vs Esperado='${blk.param}' -> ${matched ? 'CORRESPONDÊNCIA ✓' : 'diferente'}`
+      `[Sensor Cor 3D] Leitura='${detectedColorName.value}' vs Esperado='${expectedCol}' -> ${matched ? 'CORRESPONDÊNCIA ✓' : 'diferente'}`
     );
-    return;
+    return true;
   }
 
-  if (isTauriRuntime()) {
-    try {
-      const res = await invoke<SimStepResponse>('simulate_block_step', {
-        req: {
-          opcode: blk.opcode,
-          param: blk.param !== undefined ? Number(blk.param) : null,
-          current_x: robotPose.value.x,
-          current_y: robotPose.value.y,
-          current_heading: robotPose.value.heading,
-        },
-      });
-      robotPose.value.x = res.next_x;
-      robotPose.value.y = res.next_y;
-      robotPose.value.heading = res.next_heading;
-      sensors.value.portA_leftMotor = res.left_motor_pct;
-      sensors.value.portB_rightMotor = res.right_motor_pct;
-      sensors.value.imuYawDeg = res.next_heading;
-      appendLog(res.log_message);
-      return;
-    } catch {
-      // Fallback local se fora do Tauri
+  // Blocos C / E (executa sub-pilha sequencialmente no simulador)
+  if (blk.opcode === 'repeat_times' && blk.children && blk.children.length > 0) {
+    const times = Math.max(1, Math.min(20, Number(f.times ?? blk.param ?? 4)));
+    appendLog(`[Controle] Repetindo ${times}x (${blk.children.length} bloco(s))...`);
+    for (let i = 0; i < times; i++) {
+      for (const child of blk.children) {
+        const ok = await executeCurrentBlockStep(child, allowStep, execStack);
+        if (!ok) return false;
+      }
     }
+    return true;
   }
 
-  if (blk.opcode === 'move_distance') {
-    const distMm = Number(blk.param ?? 20) * 10;
-    const rad = (robotPose.value.heading * Math.PI) / 180;
-    const halfW = environment.value.width_mm / 2 - 100;
-    const halfD = environment.value.depth_mm / 2 - 100;
-    robotPose.value.x = Math.min(halfW, Math.max(-halfW, robotPose.value.x + Math.cos(rad) * distMm));
-    robotPose.value.y = Math.min(halfD, Math.max(-halfD, robotPose.value.y + Math.sin(rad) * distMm));
-    sensors.value.portA_leftMotor = 60;
-    sensors.value.portB_rightMotor = 60;
-  } else if (blk.opcode === 'turn_degrees') {
-    robotPose.value.heading = (robotPose.value.heading + Number(blk.param ?? 90) + 360) % 360;
-    sensors.value.portA_leftMotor = 50;
-    sensors.value.portB_rightMotor = -50;
-    sensors.value.imuYawDeg = robotPose.value.heading;
-  } else if (blk.opcode === 'turn_left') {
-    robotPose.value.heading = (robotPose.value.heading - Number(blk.param ?? 90) + 360) % 360;
-    sensors.value.portA_leftMotor = -50;
-    sensors.value.portB_rightMotor = 50;
-    sensors.value.imuYawDeg = robotPose.value.heading;
-  } else {
-    sensors.value.portA_leftMotor = 0;
-    sensors.value.portB_rightMotor = 0;
+  if ((blk.opcode === 'if_then' || blk.opcode === 'if_then_else') && blk.children) {
+    const condResult = evaluateBooleanSlot(blk.slots?.CONDITION);
+    const branch = condResult ? blk.children : (blk.elseChildren ?? []);
+    appendLog(`[Controle] Condição=${condResult ? 'VERDADEIRA' : 'FALSA'} -> executando ${branch.length} bloco(s).`);
+    for (const child of branch) {
+      const ok = await executeCurrentBlockStep(child, allowStep, execStack);
+      if (!ok) return false;
+    }
+    return true;
   }
-  appendLog(
-    `[VM -> Sim 3D] (${blk.opcode}) | Pose=(${Math.round(robotPose.value.x)}mm, ${Math.round(robotPose.value.y)}mm, ${robotPose.value.heading}°)`
-  );
+
+  if (blk.opcode === 'wait_until') {
+    const condBlk = blk.slots?.CONDITION;
+    appendLog(`[Controle] Aguardando condição (${condBlk?.label ?? 'slot booleano'})...`);
+    const ok = await runWaitUntil(simulationStore, () => evaluateBooleanSlot(condBlk), allowStep);
+    if (ok) {
+      appendLog(`[Controle] Condição satisfeita! (Cor atual: ${detectedColorName.value})`);
+    }
+    return ok;
+  }
+
+  if (blk.opcode === 'move_start_direction') {
+    const dir = String(f.direction ?? 'forward');
+    const spd = simulationStore.moveSpeedPct;
+    const leftPct = dir === 'backward' || dir === 'left' ? -spd : spd;
+    const rightPct = dir === 'backward' || dir === 'right' ? -spd : spd;
+    appendLog(`[Movimento] Iniciando movimento contínuo (${dir} @ ${spd}%)...`);
+    startContinuousMotion(simulationStore, robotConfig.value, environment.value, leftPct, rightPct);
+    return true;
+  }
+
+  if (blk.opcode === 'move_steer_start') {
+    const steering = Math.max(-100, Math.min(100, Number(f.steering ?? 30)));
+    const baseSpd = simulationStore.moveSpeedPct;
+    const leftPct = steering >= 0 ? baseSpd : baseSpd * (1 + steering / 50);
+    const rightPct = steering <= 0 ? baseSpd : baseSpd * (1 - steering / 50);
+    appendLog(`[Movimento] Iniciando movimento contínuo em curva (${steering})...`);
+    startContinuousMotion(simulationStore, robotConfig.value, environment.value, leftPct, rightPct);
+    return true;
+  }
+
+  if (blk.opcode === 'motor_start') {
+    const port = String(f.port ?? robotConfig.value.left_motor_port);
+    const dir = String(f.direction ?? 'clockwise') === 'counterclockwise' ? -1 : 1;
+    const spd = (simulationStore.motorSpeedPct[port] ?? 75) * dir;
+    const isLeft = port === robotConfig.value.left_motor_port;
+    const isRight = port === robotConfig.value.right_motor_port;
+    startContinuousMotion(
+      simulationStore,
+      robotConfig.value,
+      environment.value,
+      isLeft ? spd : 0,
+      isRight ? spd : 0
+    );
+    appendLog(`[Motor ${port}] Iniciado continuamente.`);
+    return true;
+  }
+
+  // Calibração de distância por rotação (1 rotação = X cm)
+  if (blk.opcode === 'set_motor_rotation_distance') {
+    const raw = Number(f.value ?? 17.5);
+    const unit = String(f.unit ?? 'cm');
+    const cm = unit === 'inches' ? raw * 2.54 : raw;
+    simulationStore.cmPerRotation = Math.max(0.5, cm);
+    appendLog(`[Calibração] 1 rotação do motor = ${simulationStore.cmPerRotation.toFixed(2)} cm`);
+    return true;
+  }
+
+  if (blk.opcode === 'set_move_speed') {
+    simulationStore.moveSpeedPct = Math.max(5, Math.min(100, Number(f.speed ?? blk.param ?? 60)));
+    appendLog(`[Movimento] Velocidade definida para ${simulationStore.moveSpeedPct}%`);
+    return true;
+  }
+
+  if (blk.opcode === 'motor_set_speed') {
+    const port = String(f.port ?? robotConfig.value.left_motor_port);
+    const spd = Math.max(-100, Math.min(100, Number(f.speed ?? 75)));
+    simulationStore.motorSpeedPct[port] = spd;
+    appendLog(`[Motor ${port}] Velocidade definida para ${spd}%`);
+    return true;
+  }
+
+  if (blk.opcode === 'var_set' || blk.opcode === 'var_change') {
+    const varName = String(f.variable ?? '');
+    const targetVar = workspaceStore.definitions.variables.find((v) => v.name === varName);
+    if (targetVar) {
+      const val = Number(f.value ?? 0);
+      targetVar.value = blk.opcode === 'var_set' ? val : Number(targetVar.value || 0) + val;
+      appendLog(`[Variável] '${varName}' = ${targetVar.value}`);
+    }
+    return true;
+  }
+
+  if (blk.opcode === 'wait_seconds') {
+    const secs = Math.max(0, Number(f.seconds ?? blk.param ?? 1));
+    appendLog(`[Controle] Esperando ${secs}s...`);
+    return await runTimedWait(simulationStore, secs, allowStep);
+  }
+
+  if (blk.opcode === 'stop_scripts' || blk.opcode === 'move_stop' || blk.opcode === 'motor_stop') {
+    simulationStore.cancelActiveMotion();
+    appendLog(`[Controle] Motores parados.`);
+    return blk.opcode !== 'stop_scripts';
+  }
+
+  // Acoplamento mecânico dos motores individuais às rodas esquerda/direita
+  if (blk.opcode === 'motor_run_for' || blk.opcode === 'motor_run_rotations') {
+    const port = String(f.port ?? robotConfig.value.left_motor_port);
+    const dir = String(f.direction ?? 'clockwise') === 'counterclockwise' ? -1 : 1;
+    const val = Number(f.value ?? blk.param ?? 1);
+    const unit = String(f.unit ?? 'rotations');
+    const spd = (simulationStore.motorSpeedPct[port] ?? 75) * dir;
+
+    const isLeft = port === robotConfig.value.left_motor_port;
+    const isRight = port === robotConfig.value.right_motor_port;
+    const leftSpeedPct = isLeft ? spd : isRight ? 0 : spd;
+    const rightSpeedPct = isRight ? spd : isLeft ? 0 : 0;
+
+    const targetWheelRad =
+      unit === 'rotations'
+        ? Math.abs(val) * Math.PI * 2
+        : unit === 'degrees'
+          ? (Math.abs(val) * Math.PI) / 180
+          : undefined;
+    const durationSec = unit === 'seconds' ? Math.max(0.05, Math.abs(val)) : undefined;
+
+    appendLog(`[Motor ${port}] Executando ${val} ${unit} (atrito=${simulationStore.surfaceFriction.toFixed(2)})...`);
+    const ok = await runDifferentialMotion(
+      simulationStore,
+      robotConfig.value,
+      environment.value,
+      { leftSpeedPct, rightSpeedPct, targetWheelRad, durationSec },
+      allowStep
+    );
+    return ok;
+  }
+
+  // Movimento direcional contínuo e calibrado
+  if (blk.opcode === 'move_direction_for' || blk.opcode === 'move_distance') {
+    const dir = blk.opcode === 'move_distance' ? 'forward' : String(f.direction ?? 'forward');
+    const rawVal = Number(f.value ?? blk.param ?? 20);
+    const unit = blk.opcode === 'move_distance' ? 'cm' : String(f.unit ?? 'cm');
+    const spd = simulationStore.moveSpeedPct;
+
+    if (dir === 'right' || dir === 'left') {
+      const sign = dir === 'right' ? 1 : -1;
+      const targetHeadingDeltaDeg = unit === 'degrees' ? Math.abs(rawVal) : 90;
+      const durationSec = unit === 'seconds' ? Math.abs(rawVal) : undefined;
+      appendLog(`[Movimento] Girando ${dir === 'right' ? 'à direita' : 'à esquerda'}...`);
+      return await runDifferentialMotion(
+        simulationStore,
+        robotConfig.value,
+        environment.value,
+        {
+          leftSpeedPct: spd * sign,
+          rightSpeedPct: -spd * sign,
+          targetHeadingDeltaDeg: durationSec ? undefined : targetHeadingDeltaDeg,
+          durationSec,
+        },
+        allowStep
+      );
+    }
+
+    const forwardSign = (dir === 'backward' ? -1 : 1) * (rawVal < 0 ? -1 : 1);
+    const absVal = Math.abs(rawVal);
+    let targetWheelRad: number | undefined;
+    let durationSec: number | undefined;
+
+    if (unit === 'rotations') {
+      targetWheelRad = absVal * Math.PI * 2;
+    } else if (unit === 'degrees') {
+      targetWheelRad = (absVal * Math.PI) / 180;
+    } else if (unit === 'seconds') {
+      durationSec = absVal;
+    } else {
+      const cm = unit === 'inches' ? absVal * 2.54 : absVal;
+      targetWheelRad = (cm / simulationStore.cmPerRotation) * Math.PI * 2;
+    }
+
+    appendLog(
+      `[Movimento] ${dir === 'backward' ? 'Recuando' : 'Avançando'} ${absVal} ${unit} (1 rot=${simulationStore.cmPerRotation}cm, atrito=${simulationStore.surfaceFriction.toFixed(2)})...`
+    );
+    return await runDifferentialMotion(
+      simulationStore,
+      robotConfig.value,
+      environment.value,
+      {
+        leftSpeedPct: spd * forwardSign,
+        rightSpeedPct: spd * forwardSign,
+        targetWheelRad,
+        durationSec,
+      },
+      allowStep
+    );
+  }
+
+  if (blk.opcode === 'turn_degrees' || blk.opcode === 'turn_left') {
+    const deg = Math.abs(Number(blk.param ?? 90));
+    const sign = blk.opcode === 'turn_left' ? -1 : 1;
+    const spd = simulationStore.moveSpeedPct;
+    appendLog(`[Movimento] ${sign > 0 ? 'Girando à direita' : 'Virando à esquerda'} ${deg}°...`);
+    return await runDifferentialMotion(
+      simulationStore,
+      robotConfig.value,
+      environment.value,
+      {
+        leftSpeedPct: spd * sign,
+        rightSpeedPct: -spd * sign,
+        targetHeadingDeltaDeg: deg,
+      },
+      allowStep
+    );
+  }
+
+  if (blk.opcode === 'move_steer_for') {
+    const steering = Math.max(-100, Math.min(100, Number(f.steering ?? 30)));
+    const val = Math.abs(Number(f.value ?? 1));
+    const unit = String(f.unit ?? 'rotations');
+    const baseSpd = simulationStore.moveSpeedPct;
+    const leftSpeedPct = steering >= 0 ? baseSpd : baseSpd * (1 + steering / 50);
+    const rightSpeedPct = steering <= 0 ? baseSpd : baseSpd * (1 - steering / 50);
+    const targetWheelRad =
+      unit === 'rotations'
+        ? val * Math.PI * 2
+        : unit === 'degrees'
+          ? (val * Math.PI) / 180
+          : undefined;
+    const durationSec = unit === 'seconds' ? val : undefined;
+
+    appendLog(`[Movimento] Curva (${steering}) por ${val} ${unit}...`);
+    return await runDifferentialMotion(
+      simulationStore,
+      robotConfig.value,
+      environment.value,
+      { leftSpeedPct, rightSpeedPct, targetWheelRad, durationSec },
+      allowStep
+    );
+  }
+
+  return true;
+}
+
+async function runSequenceFrom(startIndex: number) {
+  for (let i = startIndex; i < scriptStack.value.length; i++) {
+    if (simState.value !== 'Executing') return;
+    activeBlockIndex.value = i;
+    const completed = await executeCurrentBlockStep(scriptStack.value[i], false);
+    if (!completed) return;
+  }
+  appendLog('[VM] Programa finalizado com sucesso.');
+  simState.value = 'Idle';
+  activeBlockIndex.value = null;
+  sensors.value.portA_leftMotor = 0;
+  sensors.value.portB_rightMotor = 0;
 }
 
 function playSimulation() {
@@ -377,48 +631,30 @@ function playSimulation() {
     simState.value = 'Compiling';
     appendLog('[Compiler] Traduzindo grafo de blocos para IR/Bytecode...');
     setTimeout(() => {
+      if (simState.value !== 'Compiling') return;
       simState.value = 'Executing';
-      activeBlockIndex.value = 0;
-      void executeCurrentBlockStep(scriptStack.value[0]);
-      startLoop();
-    }, 250);
+      void runSequenceFrom(0);
+    }, 200);
     return;
   }
 
   if (simState.value === 'Paused') {
     simState.value = 'Executing';
-    startLoop();
+    const nextIdx = activeBlockIndex.value ?? 0;
+    void runSequenceFrom(nextIdx);
   }
-}
-
-function startLoop() {
-  stopLoop();
-  simInterval = setInterval(() => {
-    if (activeBlockIndex.value === null) return;
-    if (activeBlockIndex.value + 1 < scriptStack.value.length) {
-      activeBlockIndex.value++;
-      void executeCurrentBlockStep(scriptStack.value[activeBlockIndex.value]);
-    } else {
-      appendLog('[VM] Programa finalizado com sucesso.');
-      stopLoop();
-      simState.value = 'Idle';
-      activeBlockIndex.value = null;
-      sensors.value.portA_leftMotor = 0;
-      sensors.value.portB_rightMotor = 0;
-    }
-  }, 850);
 }
 
 function pauseSimulation() {
-  if (simState.value === 'Executing') {
-    stopLoop();
+  if (simState.value === 'Executing' || simState.value === 'Compiling') {
+    simulationStore.cancelActiveMotion();
     simState.value = 'Paused';
-    appendLog('[Sim] Execução pausada pelo usuário.');
+    appendLog('[Sim] Execução pausada/interrompida pelo usuário.');
   }
 }
 
-function stepSimulation() {
-  stopLoop();
+async function stepSimulation() {
+  simulationStore.cancelActiveMotion();
   simState.value = 'Paused';
   if (activeBlockIndex.value === null) {
     activeBlockIndex.value = 0;
@@ -427,20 +663,16 @@ function stepSimulation() {
   } else {
     activeBlockIndex.value = 0;
   }
-  void executeCurrentBlockStep(scriptStack.value[activeBlockIndex.value]);
+  await executeCurrentBlockStep(scriptStack.value[activeBlockIndex.value], true);
 }
 
 function resetSimulation() {
-  stopLoop();
-  simulationStore.resetRobot();
+  simulationStore.resetRobot(robotConfig.value.wheel_diameter_mm);
   appendLog('[Sim] Arena e robô reposicionados para a pose inicial.');
 }
 
 function stopLoop() {
-  if (simInterval) {
-    clearInterval(simInterval);
-    simInterval = null;
-  }
+  simulationStore.cancelActiveMotion();
 }
 
 function onSplitterMouseDown() {
